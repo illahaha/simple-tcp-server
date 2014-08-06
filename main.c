@@ -36,8 +36,6 @@
 
 #include <arpa/inet.h>
 
-#define ARRAY_NUM_ELEMS(x) (sizeof((x)) / sizeof((x)[0]))
-
 static noreturn void fatal(const char *msg);
 static noreturn void fatal2(const char *msg);
 static noreturn void fatal3(const char *msg, int err);
@@ -122,8 +120,7 @@ int main(int argc, const char *argv[])
         };
 
         len = sizeof(struct sockaddr_in);
-    }
-    else {
+    } else {
         *(struct sockaddr_in6 *)&sockaddr = (struct sockaddr_in6){
             .sin6_family = AF_INET6,
             .sin6_addr = in6addr_any,
@@ -139,7 +136,9 @@ int main(int argc, const char *argv[])
     if (listen(sockfd, backlog) == -1)
         fatal("listen()");
 
-    struct peer_data *peer_data = calloc((size_t)backlog, sizeof(*peer_data));
+    int max_num_active_conn = backlog;
+
+    struct peer_data *peer_data = calloc((size_t)max_num_active_conn, sizeof(*peer_data));
     if (peer_data == NULL)
         fatal("calloc()");
 
@@ -165,6 +164,10 @@ int main(int argc, const char *argv[])
     if (err != 0)
         fatal3("pthread_create()", err);
 
+    err = pthread_detach(signal_handling_thread);
+    if (err != 0)
+        fatal3("pthread_detach()", err);
+
     // Now set up the kqueue for worker threads
 
     int worker_queue_fd = kqueue();
@@ -173,7 +176,7 @@ int main(int argc, const char *argv[])
 
     struct kevent events[2]; // gets reused throughout
 
-    // Workers will get notfied of arrives signals through pipe
+    // Workers will get notfied of arrived signals through pipe
     EV_SET(&events[0], signal_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
 
     if (kevent(worker_queue_fd, events, 1, NULL, 0, NULL) == -1)
@@ -195,7 +198,7 @@ int main(int argc, const char *argv[])
 
     for (int i = 0; i < num_threads; ++i) {
         worker_data[i].kqueue_fd = worker_queue_fd;
-        worker_data[i].num_events = backlog + 1;
+        worker_data[i].num_events = max_num_active_conn + 1;
         worker_data[i].signal_pipe_fd = signal_pipe_fds[0];
         worker_data[i].term_pipe_fd = term_pipe_fds[1];
 
@@ -218,20 +221,19 @@ int main(int argc, const char *argv[])
     if (kevent(accept_queue_fd, events, 2, NULL, 0, NULL) == -1)
         fatal("kevent()");
 
-    for (int i = 0; i < backlog; (i + 1) == backlog ? i = 0 : ++i) {
-        if (peer_data[i].is_connected)
-            continue;
+    int idx = 0;
 
+    for (;;) {
         struct kevent revents[2];
-        int events_triggered = kevent(accept_queue_fd, NULL, 0, revents,
-                                      ARRAY_NUM_ELEMS(revents), NULL);
+
+        int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 2, NULL);
         if (events_triggered == -1)
             fatal("kevent()");
 
-        for (int j = 0; j < events_triggered; ++j) {
-            assert(revents[j].filter == EVFILT_READ);
+        for (int i = 0; i < events_triggered; ++i) {
+            assert(revents[i].filter == EVFILT_READ);
 
-            int fd = (int)revents[j].ident;
+            int fd = (int)revents[i].ident;
 
             if (fd == signal_pipe_fds[0]) {
                 // Got a signal. Now spin up a timer and
@@ -241,37 +243,59 @@ int main(int argc, const char *argv[])
 
             // Got new connection
 
-            socklen_t size = sizeof(peer_data[i].sockaddr);
-            int new_fd = accept(sockfd, (struct sockaddr *)&peer_data[i].sockaddr,
-                                &size);
+            assert(!peer_data[idx].is_connected);
+
+            socklen_t size = sizeof(peer_data[idx].sockaddr);
+            int new_fd = accept(sockfd, (struct sockaddr *)&peer_data[idx].sockaddr, &size);
             if (new_fd == -1)
                 fatal("accept()");
 
-            int af = peer_data[i].sockaddr.ss_family;
+            int af = peer_data[idx].sockaddr.ss_family;
             switch (af) {
             case AF_INET:
-                peer_data[i].addr_ptr = &((struct sockaddr_in *)&peer_data[i].sockaddr)->sin_addr;
-                peer_data[i].port = ((struct sockaddr_in *)&peer_data[i].sockaddr)->sin_port;
+                peer_data[idx].addr_ptr = &((struct sockaddr_in *)&peer_data[idx].sockaddr)->sin_addr;
+                peer_data[idx].port = ((struct sockaddr_in *)&peer_data[idx].sockaddr)->sin_port;
                 break;
             case AF_INET6:
-                peer_data[i].addr_ptr = &((struct sockaddr_in6 *)&peer_data[i].sockaddr)->sin6_addr;
-                peer_data[i].port = ((struct sockaddr_in6 *)&peer_data[i].sockaddr)->sin6_port;
+                peer_data[idx].addr_ptr = &((struct sockaddr_in6 *)&peer_data[idx].sockaddr)->sin6_addr;
+                peer_data[idx].port = ((struct sockaddr_in6 *)&peer_data[idx].sockaddr)->sin6_port;
                 break;
             }
 
-            inet_ntop(af, peer_data[i].addr_ptr, peer_data[i].ascii_addr,
-                      sizeof(peer_data[i].ascii_addr));
+            inet_ntop(af, peer_data[idx].addr_ptr, peer_data[idx].ascii_addr, sizeof(peer_data[idx].ascii_addr));
 
-            printf("[INFO] New connection from %s:%u\n", peer_data[i].ascii_addr,
-                   peer_data[i].port);
+            printf("[INFO] New connection from %s:%u\n", peer_data[idx].ascii_addr, peer_data[idx].port);
 
-            peer_data[i].is_connected = 1;
-            peer_data[i].fd = new_fd;
+            peer_data[idx].is_connected = 1;
+            peer_data[idx].fd = new_fd;
 
-            EV_SET(&events[0], new_fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, &peer_data[i]);
+            EV_SET(&events[0], new_fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, &peer_data[idx]);
 
             if (kevent(worker_queue_fd, events, 1, NULL, 0, NULL) == -1)
                 fatal("kevent()");
+
+            // Look for another free peer
+            int tmp = idx;
+            for (int j = idx; j < max_num_active_conn; ++j)
+                if (!peer_data[j].is_connected)
+                    idx = j;
+
+            if (tmp != idx)
+                continue;
+
+            for (int j = 0; j < idx; ++j)
+                if (!peer_data[j].is_connected)
+                    idx = j;
+
+            if (tmp != idx)
+                continue;
+
+            // No free slots, reallocate...
+            peer_data = realloc(peer_data, (size_t)max_num_active_conn * 2);
+            if (peer_data == NULL)
+                fatal("realloc()");
+            max_num_active_conn *= 2;
+            idx = max_num_active_conn / 2;
         }
     }
 
@@ -281,8 +305,13 @@ wait_for_thread_termination:;
     if (thread_term_queue_fd == -1)
         fatal("kqueue()");
 
+    struct kevent revents[2];
+
     EV_SET(&events[0], term_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
     EV_SET(&events[1], 0, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, 5, NULL);
+
+    if (kevent(thread_term_queue_fd, events, 2, NULL, 0, NULL) == -1)
+        fatal("kevent()");
 
     // Each thread sends 1 byte through the pipe to signal successful
     // termination. If we got num_threads amount of bytes through the pipe,
@@ -295,9 +324,7 @@ wait_for_thread_termination:;
     printf("Waiting for worker threads to quit...\n");
 
     for (;;) {
-        struct kevent revents[2];
-        int num = kevent(thread_term_queue_fd, events, 2, revents,
-                         ARRAY_NUM_ELEMS(revents), NULL);
+        int num = kevent(thread_term_queue_fd, events, 2, revents, 2, NULL);
         if (num == -1)
             fatal("kevent()");
 
@@ -361,8 +388,10 @@ void *handle_signals(void *data)
 void *worker_thread(void *data)
 {
     struct worker_data *info = data;
+    int kqueue_fd = info->kqueue_fd;
+    int num_revents = info->num_events;
 
-    struct kevent *revents = calloc((size_t)info->num_events, sizeof(*revents));
+    struct kevent *revents = calloc((size_t)num_revents, sizeof(*revents));
     if (revents == NULL)
         fatal("calloc()");
 
@@ -375,8 +404,8 @@ void *worker_thread(void *data)
     struct kevent *event_ptr = NULL;
 
     for (;;) {
-        int events_recvd = kevent(info->kqueue_fd, event_ptr, re_add_event,
-                                  revents, info->num_events, NULL);
+        int events_recvd = kevent(kqueue_fd, event_ptr, re_add_event,
+                                  revents, num_revents, NULL);
         if (events_recvd == -1)
             fatal("kevent()");
 
