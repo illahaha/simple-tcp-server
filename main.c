@@ -40,7 +40,8 @@ static noreturn void fatal(const char *msg);
 static noreturn void fatal2(const char *msg);
 static noreturn void fatal3(const char *msg, int err);
 
-static unsigned short strtous(const char *restrict str, char **restrict endptr, int base);
+static unsigned short strtous(const char *restrict str, char **restrict endptr,
+                              int base);
 static int strtoi(const char *restrict str, char **restrict endptr, int base);
 static unsigned short str_to_ushort(const char *str, int base);
 static int str_to_int(const char *str, int base);
@@ -66,14 +67,16 @@ struct peer_data {
 };
 
 struct worker_data {
-    int kqueue_fd;
+    pthread_rwlock_t rwlock; // protects peer_data (which is passed as udata via kqueue)
+    int kqueue;
     int num_events;
-    int signal_pipe_fd; // Got SIGINT/SIGTERM -> terminate self
-    int term_pipe_fd; // Notify main thread of graceful termination
+    int signal_pipe; // Got SIGINT/SIGTERM -> terminate self
+    int term_pipe; // Notify main thread of graceful termination
+    int realloc_pipe; // Thread has to realloc event array
 };
 
 struct signal_handling_thread_data {
-    int pipe_fd; // Notify worker threads of signal
+    int signal_pipe; // Notify worker threads of signal
     sigset_t sigset;
 };
 
@@ -142,7 +145,8 @@ int main(int argc, const char *argv[])
 
     int max_num_active_conn = backlog;
 
-    struct peer_data *peer_data = calloc((size_t)max_num_active_conn, sizeof(*peer_data));
+    struct peer_data *peer_data = calloc((size_t)max_num_active_conn,
+                                         sizeof(*peer_data));
     if (peer_data == NULL)
         fatal("calloc()");
 
@@ -160,11 +164,12 @@ int main(int argc, const char *argv[])
 
     struct signal_handling_thread_data sig_handling_data = {
         .sigset = set,
-        .pipe_fd = signal_pipe_fds[1]
+        .signal_pipe = signal_pipe_fds[1]
     };
 
     pthread_t signal_handling_thread;
-    int err = pthread_create(&signal_handling_thread, NULL, handle_signals, &sig_handling_data);
+    int err = pthread_create(&signal_handling_thread, NULL, handle_signals,
+                             &sig_handling_data);
     if (err != 0)
         fatal3("pthread_create()", err);
 
@@ -180,33 +185,38 @@ int main(int argc, const char *argv[])
 
     struct kevent events[2]; // gets reused throughout
 
+    int realloc_pipe_fds[2];
+    if (pipe(realloc_pipe_fds) == -1)
+        fatal("pipe()");
+
     // Workers will get notfied of arrived signals through pipe
     EV_SET(&events[0], signal_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+    EV_SET(&events[1], realloc_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
 
-    if (kevent(worker_queue_fd, events, 1, NULL, 0, NULL) == -1)
+    if (kevent(worker_queue_fd, events, 2, NULL, 0, NULL) == -1)
         fatal("kevent()");
 
     int term_pipe_fds[2];
     if (pipe(term_pipe_fds) == -1)
         fatal("pipe()");
 
-    int num_threads = MIN(get_num_cpus(), backlog);
+    struct worker_data worker_data = {
+        .kqueue = worker_queue_fd,
+        .num_events = max_num_active_conn + 2,
+        .signal_pipe = signal_pipe_fds[0],
+        .term_pipe = term_pipe_fds[1],
+        .rwlock = PTHREAD_RWLOCK_INITIALIZER,
+        .realloc_pipe = realloc_pipe_fds[0]
+    };
 
-    struct worker_data *worker_data = calloc((size_t)num_threads, sizeof(*worker_data));
-    if (worker_data == NULL)
-        fatal("calloc()");
+    int num_threads = MIN(get_num_cpus(), backlog);
 
     pthread_t *threads = calloc((size_t)num_threads, sizeof(*threads));
     if (threads == NULL)
         fatal("calloc()");
 
     for (int i = 0; i < num_threads; ++i) {
-        worker_data[i].kqueue_fd = worker_queue_fd;
-        worker_data[i].num_events = max_num_active_conn + 1;
-        worker_data[i].signal_pipe_fd = signal_pipe_fds[0];
-        worker_data[i].term_pipe_fd = term_pipe_fds[1];
-
-        err = pthread_create(&threads[i], NULL, worker_thread, &worker_data[i]);
+        err = pthread_create(&threads[i], NULL, worker_thread, &worker_data);
         if (err != 0)
             fatal3("pthread_create()", err);
 
@@ -215,6 +225,25 @@ int main(int argc, const char *argv[])
             fatal3("pthread_detach()", err);
     }
 
+    // We could reuse one of the other 2 queues, but I think this is cleaner.
+    int thread_term_queue_fd = kqueue();
+    if (thread_term_queue_fd == -1)
+        fatal("kqueue()");
+
+    EV_SET(&events[0], term_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+
+    if (kevent(thread_term_queue_fd, events, 1, NULL, 0, NULL) == -1)
+        fatal("kevent()");
+
+    // Each thread sends 1 byte through the pipe to signal successful
+    // termination. If we got num_threads amount of bytes through the pipe,
+    // all threads exited and we can gracefully shutdown.
+    int term_pipe_rem_size = num_threads;
+    unsigned char *buf = malloc((size_t)num_threads);
+    if (buf == NULL)
+        fatal("malloc()");
+
+    // Seperate queue for accept() and signal-pipe.
     int accept_queue_fd = kqueue();
     if (accept_queue_fd == -1)
         fatal("kqueue()");
@@ -228,16 +257,14 @@ int main(int argc, const char *argv[])
     int idx = 0;
 
     for (;;) {
-        struct kevent revents[2];
-
-        int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 2, NULL);
+        int events_triggered = kevent(accept_queue_fd, NULL, 0, events, 2, NULL);
         if (events_triggered == -1)
             fatal("kevent()");
 
         for (int i = 0; i < events_triggered; ++i) {
-            assert(revents[i].filter == EVFILT_READ);
+            assert(events[i].filter == EVFILT_READ);
 
-            int fd = (int)revents[i].ident;
+            int fd = (int)events[i].ident;
 
             if (fd == signal_pipe_fds[0]) {
                 // Got a signal. Now spin up a timer and
@@ -250,7 +277,8 @@ int main(int argc, const char *argv[])
             assert(!peer_data[idx].is_connected);
 
             socklen_t size = sizeof(peer_data[idx].sockaddr);
-            int new_fd = accept(sockfd, (struct sockaddr *)&peer_data[idx].sockaddr, &size);
+            int new_fd = accept(sockfd, (struct sockaddr *)&peer_data[idx].sockaddr,
+                                &size);
             if (new_fd == -1)
                 fatal("accept()");
 
@@ -266,102 +294,128 @@ int main(int argc, const char *argv[])
                 break;
             }
 
-            inet_ntop(af, peer_data[idx].raw_addr_ptr, peer_data[idx].ascii_addr, sizeof(peer_data[idx].ascii_addr));
+            inet_ntop(af, peer_data[idx].raw_addr_ptr, peer_data[idx].ascii_addr,
+                      sizeof(peer_data[idx].ascii_addr));
 
-            printf("[INFO] New connection from %s:%u\n", peer_data[idx].ascii_addr, peer_data[idx].port);
+            printf("[INFO] New connection from %s:%u\n", peer_data[idx].ascii_addr,
+                   peer_data[idx].port);
 
             peer_data[idx].is_connected = 1;
             peer_data[idx].fd = new_fd;
 
-            EV_SET(&events[0], new_fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, &peer_data[idx]);
+            EV_SET(&events[0], new_fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0,
+                   &peer_data[idx]);
 
             if (kevent(worker_queue_fd, events, 1, NULL, 0, NULL) == -1)
                 fatal("kevent()");
 
             // Look for another free peer
             int tmp = idx;
-            for (int j = idx; j < max_num_active_conn; ++j)
-                if (!peer_data[j].is_connected)
+            for (int j = idx; j < max_num_active_conn; ++j) {
+                if (!peer_data[j].is_connected) {
                     idx = j;
+                    break;
+                }
+            }
 
             if (tmp != idx)
                 continue;
 
-            for (int j = 0; j < idx; ++j)
-                if (!peer_data[j].is_connected)
+            for (int j = 0; j < idx; ++j) {
+                if (!peer_data[j].is_connected) {
                     idx = j;
+                    break;
+                }
+            }
 
             if (tmp != idx)
                 continue;
 
             // No free slots, reallocate...
-            peer_data = realloc(peer_data, (size_t)max_num_active_conn * 2);
+            err = pthread_rwlock_wrlock(&worker_data.rwlock);
+            if (err != 0)
+                fatal3("pthread_rwlock_wrlock()", err);
+
+            max_num_active_conn *= 2;
+            peer_data = realloc(peer_data, (size_t)max_num_active_conn);
             if (peer_data == NULL)
                 fatal("realloc()");
-            max_num_active_conn *= 2;
-            idx = max_num_active_conn / 2;
+
+            struct kevent *events2 = calloc((size_t)max_num_active_conn,
+                                            sizeof(*events2));
+            if (events2 == NULL)
+                fatal("malloc()");
+
+            int num_new_events = 0;
+            for (int j = 0; j < max_num_active_conn; ++j)
+                if (peer_data[j].is_connected)
+                    EV_SET(&events2[num_new_events++], peer_data[j].fd,
+                           EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, &peer_data[j]);
+
+            if (kevent(worker_queue_fd, events2, num_new_events, NULL, 0, NULL) == -1)
+                fatal("kevent()");
+
+            free(events2);
+
+            for (int j = 0; j < max_num_active_conn; ++j)
+                if (!peer_data[j].is_connected) {
+                    idx = j;
+                    break;
+                }
+
+            int new_len = max_num_active_conn + 2;
+            for (int j = 0; j < num_threads; ++j)
+                if (write(realloc_pipe_fds[1], &new_len, sizeof(new_len)) == -1)
+                    fatal("write()");
+
+            err = pthread_rwlock_unlock(&worker_data.rwlock);
+            if (err != 0)
+                fatal3("pthread_rwlock_unlock()", err);
         }
     }
 
 wait_for_thread_termination:;
-    // We could reuse one of the other 2 queues, but I think this is cleaner.
-    int thread_term_queue_fd = kqueue();
-    if (thread_term_queue_fd == -1)
-        fatal("kqueue()");
-
-    struct kevent revents[2];
-
-    EV_SET(&events[0], term_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
-    EV_SET(&events[1], 0, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, 5, NULL);
-
-    if (kevent(thread_term_queue_fd, events, 2, NULL, 0, NULL) == -1)
-        fatal("kevent()");
-
-    // Each thread sends 1 byte through the pipe to signal successful
-    // termination. If we got num_threads amount of bytes through the pipe,
-    // all threads exited and we can gracefully shutdown.
-    int term_pipe_rem_size = num_threads;
-    unsigned char *buf = malloc((size_t)num_threads);
-    if (buf == NULL)
-        fatal("malloc()");
-
     printf("Waiting for worker threads to quit...\n");
 
+    struct timespec timeout = {
+        .tv_sec = 10,
+        .tv_nsec = 0
+    };
+
     for (;;) {
-        int num = kevent(thread_term_queue_fd, events, 2, revents, 2, NULL);
+        int num = kevent(thread_term_queue_fd, NULL, 0, events, 1, &timeout);
         if (num == -1)
             fatal("kevent()");
 
-        for (int i = 0; i < num; ++i) {
-            if (revents[i].filter == EVFILT_TIMER) {
-                printf("Some threads got stuck. Killing those...\n");
+        if (num == 0) {
+            // Time's up!
+            printf("Some threads got stuck. Killing those...\n");
 
-                for (int j = 0; j < num_threads; ++j)
-                    pthread_cancel(threads[j]);
+            for (int j = 0; j < num_threads; ++j)
+                pthread_cancel(threads[j]);
 
-                goto end;
-            }
-
-            // Some thread(s) shut down
-
-            int thread_fd = (int)revents[i].ident;
-            size_t bytes_to_read = (size_t)revents[i].data;
-
-            assert(bytes_to_read <= (size_t)num_threads);
-
-            if (read(thread_fd, buf, bytes_to_read) == -1)
-                fatal("read()");
-
-            term_pipe_rem_size -= bytes_to_read;
-            if (term_pipe_rem_size == 0)
-                goto end;
+            goto end;
         }
+
+        // Some thread(s) shut down
+
+        int thread_fd = (int)events[0].ident;
+        size_t bytes_to_read = (size_t)events[0].data;
+
+        assert(bytes_to_read <= (size_t)num_threads);
+
+        if (read(thread_fd, buf, bytes_to_read) == -1)
+            fatal("read()");
+
+        term_pipe_rem_size -= bytes_to_read;
+        if (term_pipe_rem_size == 0)
+            goto end;
     }
 
 end:;
     printf("Shutting down...\n");
 
-    for (int i = 0; i < backlog; ++i)
+    for (int i = 0; i < max_num_active_conn; ++i)
         if (peer_data[i].is_connected)
             shutdown(peer_data[i].fd, SHUT_RDWR);
 
@@ -383,7 +437,7 @@ void *handle_signals(void *data)
 
     unsigned char dummy;
 
-    if (write(info->pipe_fd, &dummy, sizeof(dummy)) == -1)
+    if (write(info->signal_pipe, &dummy, sizeof(dummy)) == -1)
         fatal("write()");
 
     return NULL;
@@ -392,7 +446,7 @@ void *handle_signals(void *data)
 void *worker_thread(void *data)
 {
     struct worker_data *info = data;
-    int kqueue_fd = info->kqueue_fd;
+    int kqueue = info->kqueue;
     int num_revents = info->num_events;
 
     struct kevent *revents = calloc((size_t)num_revents, sizeof(*revents));
@@ -408,7 +462,8 @@ void *worker_thread(void *data)
     struct kevent *event_ptr = NULL;
 
     for (;;) {
-        int events_recvd = kevent(kqueue_fd, event_ptr, re_add_event,
+    kevent_again:;
+        int events_recvd = kevent(kqueue, event_ptr, re_add_event,
                                   revents, num_revents, NULL);
         if (events_recvd == -1)
             fatal("kevent()");
@@ -421,15 +476,30 @@ void *worker_thread(void *data)
 
             int fd = (int)revents[i].ident;
 
-            if (fd == info->signal_pipe_fd) {
+            if (fd == info->signal_pipe) {
                 printf("[INFO] Worker thread shutting down\n");
 
                 unsigned char t;
-                if (write(info->term_pipe_fd, &t, sizeof(t)) == -1)
+                if (write(info->term_pipe, &t, sizeof(t)) == -1)
                     fatal("write()");
 
                 return NULL;
             }
+
+            if (fd == info->realloc_pipe) {
+                if (read(info->realloc_pipe, &num_revents, sizeof(num_revents)) == -1)
+                    fatal("read()");
+
+                revents = realloc(revents, (size_t)num_revents);
+                if (revents == NULL)
+                    fatal("realloc()");
+
+                goto kevent_again;
+            }
+
+            int err = pthread_rwlock_rdlock(&info->rwlock);
+            if (err != 0)
+                fatal3("pthread_rwlock_rdlock()", err);
 
             struct peer_data *peer_data = revents[i].udata;
             size_t bytes_to_read = (size_t)revents[i].data;
@@ -473,6 +543,10 @@ void *worker_thread(void *data)
                    revents[i].fflags, revents[i].data, revents[i].udata);
             event_ptr = event;
             re_add_event = 1;
+
+            err = pthread_rwlock_unlock(&info->rwlock);
+            if (err != 0)
+                fatal3("pthread_rwlock_unlock()", err);
         }
     }
 }
