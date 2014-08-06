@@ -54,8 +54,12 @@ static void *worker_thread(void *data);
 
 struct peer_data {
     struct sockaddr_storage sockaddr;
-    void *addr_ptr; // points to somewhere in sockaddr
-    int is_connected; // XXX: should be atomic
+    union {
+        void *raw_addr_ptr;
+        struct in_addr *ip4_addr_ptr;
+        struct in6_addr *ip6_addr_ptr;
+    }; // Points into sockaddr.
+    int is_connected; // XXX: Should be atomic.
     int fd;
     in_port_t port;
     char ascii_addr[INET6_ADDRSTRLEN];
@@ -253,16 +257,16 @@ int main(int argc, const char *argv[])
             int af = peer_data[idx].sockaddr.ss_family;
             switch (af) {
             case AF_INET:
-                peer_data[idx].addr_ptr = &((struct sockaddr_in *)&peer_data[idx].sockaddr)->sin_addr;
+                peer_data[idx].ip4_addr_ptr = &((struct sockaddr_in *)&peer_data[idx].sockaddr)->sin_addr;
                 peer_data[idx].port = ((struct sockaddr_in *)&peer_data[idx].sockaddr)->sin_port;
                 break;
             case AF_INET6:
-                peer_data[idx].addr_ptr = &((struct sockaddr_in6 *)&peer_data[idx].sockaddr)->sin6_addr;
+                peer_data[idx].ip6_addr_ptr = &((struct sockaddr_in6 *)&peer_data[idx].sockaddr)->sin6_addr;
                 peer_data[idx].port = ((struct sockaddr_in6 *)&peer_data[idx].sockaddr)->sin6_port;
                 break;
             }
 
-            inet_ntop(af, peer_data[idx].addr_ptr, peer_data[idx].ascii_addr, sizeof(peer_data[idx].ascii_addr));
+            inet_ntop(af, peer_data[idx].raw_addr_ptr, peer_data[idx].ascii_addr, sizeof(peer_data[idx].ascii_addr));
 
             printf("[INFO] New connection from %s:%u\n", peer_data[idx].ascii_addr, peer_data[idx].port);
 
