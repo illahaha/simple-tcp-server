@@ -141,10 +141,6 @@ int main(int argc, const char *argv[])
     if (worker_queue_fd == -1)
         fatal("kqueue()");
 
-    int thread_term_queue_fd = kqueue();
-    if (thread_term_queue_fd == -1)
-        fatal("kqueue()");
-
     int accept_queue_fd = kqueue();
     if (accept_queue_fd == -1)
         fatal("kqueue()");
