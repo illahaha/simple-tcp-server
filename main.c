@@ -36,6 +36,34 @@
 
 #include <arpa/inet.h>
 
+#define EVENT_SIGNAL_ARRIVED 1
+
+#define ATOMIC_LOAD(x) __atomic_load_n(&(x), __ATOMIC_SEQ_CST)
+#define ATOMIC_STORE(x, y) __atomic_store_n(&x, y, __ATOMIC_SEQ_CST)
+
+struct peer_data {
+    struct sockaddr_storage sockaddr;
+    union {
+        void *raw_addr_ptr;
+        struct in_addr *ip4_addr_ptr;
+        struct in6_addr *ip6_addr_ptr;
+    }; // Points into sockaddr.
+    int is_connected;
+    int fd;
+    in_port_t port;
+    char ascii_addr[INET6_ADDRSTRLEN];
+};
+
+struct worker_data {
+    int active_conn_kqueue;
+    int num_events;
+};
+
+struct sigthread_data {
+    int main_thread_kqueue;
+    sigset_t sigset;
+};
+
 static noreturn void fatal(const char *msg);
 static noreturn void fatal2(const char *msg);
 static noreturn void fatal3(const char *msg, int err);
@@ -53,37 +81,21 @@ static void *handle_signals(void *data);
 
 static void *worker_thread(void *data);
 
-struct peer_data {
-    struct sockaddr_storage sockaddr;
-    union {
-        void *raw_addr_ptr;
-        struct in_addr *ip4_addr_ptr;
-        struct in6_addr *ip6_addr_ptr;
-    }; // Points into sockaddr.
-    int is_connected; // XXX: Should be atomic.
-    int fd;
-    in_port_t port;
-    char ascii_addr[INET6_ADDRSTRLEN];
-};
+static void accept_conn(int fd, struct peer_data *peer);
 
-struct worker_data {
-    pthread_rwlock_t rwlock; // protects peer_data (which is passed as udata via kqueue)
-    int kqueue;
-    int num_events;
-    int signal_pipe; // Got SIGINT/SIGTERM -> terminate self
-    int term_pipe; // Notify main thread of graceful termination
-    int realloc_cnt; // XXX: Should be atomic
-};
+static void add_to_kqueue(int fd, uintptr_t ident, int16_t filter, uint16_t flags,
+                          uint32_t fflags, intptr_t data, void *udata);
 
-struct signal_handling_thread_data {
-    int signal_pipe; // Notify worker threads of signal
-    sigset_t sigset;
-};
+static struct peer_data *get_free_peer(struct peer_data *const *peer_ptrs, int max);
+
+static int create_socket(in_port_t port, struct sockaddr_storage *sockaddr, socklen_t *len);
 
 int main(int argc, const char *argv[])
 {
     if (argc < 2)
         fatal2("Missing port number as argument");
+
+    in_port_t port = str_to_ushort(argv[1], 0);
 
     int somaxconn = get_somaxconn();
     int backlog = somaxconn;
@@ -101,41 +113,9 @@ int main(int argc, const char *argv[])
         }
     }
 
-    // Prefer IPv6, but fallback to IPv4 when not available
-
-    int sockfd;
     struct sockaddr_storage sockaddr;
     socklen_t len;
-
-    sockfd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (sockfd == -1) {
-        if (errno != EAFNOSUPPORT)
-            fatal("socket()");
-
-        // No IPv6, so...
-
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd == -1)
-            fatal("socket()");
-
-        *(struct sockaddr_in *)&sockaddr = (struct sockaddr_in){
-            .sin_family = AF_INET,
-            .sin_addr = {
-                .s_addr = INADDR_ANY
-            },
-            .sin_port = htons(str_to_ushort(argv[1], 0))
-        };
-
-        len = sizeof(struct sockaddr_in);
-    } else {
-        *(struct sockaddr_in6 *)&sockaddr = (struct sockaddr_in6){
-            .sin6_family = AF_INET6,
-            .sin6_addr = in6addr_any,
-            .sin6_port = htons(str_to_ushort(argv[1], 0))
-        };
-
-        len = sizeof(struct sockaddr_in6);
-    }
+    int sockfd = create_socket(port, &sockaddr, &len);
 
     if (bind(sockfd, (struct sockaddr *)&sockaddr, len) == -1)
         fatal("bind()");
@@ -145,10 +125,32 @@ int main(int argc, const char *argv[])
 
     int max_num_active_conn = backlog;
 
-    struct peer_data *peer_data = calloc((size_t)max_num_active_conn,
-                                         sizeof(*peer_data));
-    if (peer_data == NULL)
+    struct peer_data **peer_ptrs = calloc((size_t)max_num_active_conn, sizeof(*peer_ptrs));
+    if (peer_ptrs == NULL)
         fatal("calloc()");
+
+    for (int i = 0; i < max_num_active_conn; ++i) {
+        peer_ptrs[i] = malloc(sizeof(*peer_ptrs[i]));
+        if (peer_ptrs[i] == NULL)
+            fatal("malloc()");
+
+        peer_ptrs[i]->is_connected = 0;
+    }
+
+    int worker_queue_fd = kqueue();
+    if (worker_queue_fd == -1)
+        fatal("kqueue()");
+
+    int thread_term_queue_fd = kqueue();
+    if (thread_term_queue_fd == -1)
+        fatal("kqueue()");
+
+    int accept_queue_fd = kqueue();
+    if (accept_queue_fd == -1)
+        fatal("kqueue()");
+
+    add_to_kqueue(accept_queue_fd, EVENT_SIGNAL_ARRIVED, EVFILT_USER, EV_ADD, 0, 0, NULL);
+    add_to_kqueue(accept_queue_fd, (uintptr_t)sockfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
 
     // Stuff for handling signals in its own thread
     sigset_t set;
@@ -158,18 +160,13 @@ int main(int argc, const char *argv[])
     if (pthread_sigmask(SIG_SETMASK, &set, NULL) == -1)
         fatal("pthread_sigmask()");
 
-    int signal_pipe_fds[2];
-    if (pipe(signal_pipe_fds) == -1)
-        fatal("pipe()");
-
-    struct signal_handling_thread_data sig_handling_data = {
-        .sigset = set,
-        .signal_pipe = signal_pipe_fds[1]
+    struct sigthread_data sig_handling_data = {
+        .main_thread_kqueue = accept_queue_fd,
+        .sigset = set
     };
 
     pthread_t signal_handling_thread;
-    int err = pthread_create(&signal_handling_thread, NULL, handle_signals,
-                             &sig_handling_data);
+    int err = pthread_create(&signal_handling_thread, NULL, handle_signals, &sig_handling_data);
     if (err != 0)
         fatal3("pthread_create()", err);
 
@@ -177,31 +174,9 @@ int main(int argc, const char *argv[])
     if (err != 0)
         fatal3("pthread_detach()", err);
 
-    // Now set up the kqueue for worker threads
-
-    int worker_queue_fd = kqueue();
-    if (worker_queue_fd == -1)
-        fatal("kqueue()");
-
-    struct kevent events[2]; // gets reused throughout
-
-    // Workers will get notfied of arrived signals through pipe
-    EV_SET(&events[0], signal_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
-
-    if (kevent(worker_queue_fd, events, 1, NULL, 0, NULL) == -1)
-        fatal("kevent()");
-
-    int term_pipe_fds[2];
-    if (pipe(term_pipe_fds) == -1)
-        fatal("pipe()");
-
     struct worker_data worker_data = {
-        .kqueue = worker_queue_fd,
-        .num_events = max_num_active_conn + 2,
-        .signal_pipe = signal_pipe_fds[0],
-        .term_pipe = term_pipe_fds[1],
-        .rwlock = PTHREAD_RWLOCK_INITIALIZER,
-        .realloc_cnt = 0
+        .active_conn_kqueue = worker_queue_fd,
+        .num_events = max_num_active_conn + 2
     };
 
     int num_threads = MIN(get_num_cpus(), backlog);
@@ -220,203 +195,75 @@ int main(int argc, const char *argv[])
             fatal3("pthread_detach()", err);
     }
 
-    // We could reuse one of the other 2 queues, but I think this is cleaner.
-    int thread_term_queue_fd = kqueue();
-    if (thread_term_queue_fd == -1)
-        fatal("kqueue()");
-
-    EV_SET(&events[0], term_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
-
-    if (kevent(thread_term_queue_fd, events, 1, NULL, 0, NULL) == -1)
-        fatal("kevent()");
-
-    // Each thread sends 1 byte through the pipe to signal successful
-    // termination. If we got num_threads amount of bytes through the pipe,
-    // all threads exited and we can gracefully shutdown.
-    int term_pipe_rem_size = num_threads;
-    unsigned char *buf = malloc((size_t)num_threads);
-    if (buf == NULL)
-        fatal("malloc()");
-
-    // Seperate queue for accept() and signal-pipe.
-    int accept_queue_fd = kqueue();
-    if (accept_queue_fd == -1)
-        fatal("kqueue()");
-
-    EV_SET(&events[0], sockfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    EV_SET(&events[1], signal_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
-
-    if (kevent(accept_queue_fd, events, 2, NULL, 0, NULL) == -1)
-        fatal("kevent()");
-
-    int idx = 0;
+    struct peer_data *peer = peer_ptrs[0];
 
     for (;;) {
-        int events_triggered = kevent(accept_queue_fd, NULL, 0, events, 2, NULL);
+        struct kevent revents[2];
+        int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 2, NULL);
         if (events_triggered == -1)
             fatal("kevent()");
 
         for (int i = 0; i < events_triggered; ++i) {
-            assert(events[i].filter == EVFILT_READ);
+            if (revents[i].flags & EV_ERROR)
+                fatal3("Error processing events", (int)revents[i].data);
 
-            int fd = (int)events[i].ident;
+            if (revents[i].filter == EVFILT_USER) {
+                assert(revents[i].ident == EVENT_SIGNAL_ARRIVED);
 
-            if (fd == signal_pipe_fds[0]) {
-                // Got a signal. Now spin up a timer and
-                // wait for worker threads to exit cleanly.
-                goto wait_for_thread_termination;
+                for (int j = 0; j < num_threads; ++j)
+                    pthread_cancel(threads[j]);
+
+                printf("[INFO] Shutting down...\n");
+
+                for (int j = 0; j < max_num_active_conn; ++j)
+                    if (peer_ptrs[j]->is_connected)
+                        shutdown(peer_ptrs[j]->fd, SHUT_RDWR);
+
+                exit(EXIT_SUCCESS);
             }
 
             // Got new connection
 
-            assert(!peer_data[idx].is_connected);
+            assert(revents[i].filter == EVFILT_READ);
+            assert((int)revents[i].ident == sockfd);
+            assert(!ATOMIC_LOAD(peer->is_connected));
 
-            socklen_t size = sizeof(peer_data[idx].sockaddr);
-            int new_fd = accept(sockfd, (struct sockaddr *)&peer_data[idx].sockaddr,
-                                &size);
-            if (new_fd == -1)
-                fatal("accept()");
+            accept_conn(sockfd, peer);
 
-            int af = peer_data[idx].sockaddr.ss_family;
-            switch (af) {
-            case AF_INET:
-                peer_data[idx].ip4_addr_ptr = &((struct sockaddr_in *)&peer_data[idx].sockaddr)->sin_addr;
-                peer_data[idx].port = ((struct sockaddr_in *)&peer_data[idx].sockaddr)->sin_port;
-                break;
-            case AF_INET6:
-                peer_data[idx].ip6_addr_ptr = &((struct sockaddr_in6 *)&peer_data[idx].sockaddr)->sin6_addr;
-                peer_data[idx].port = ((struct sockaddr_in6 *)&peer_data[idx].sockaddr)->sin6_port;
-                break;
-            }
+            add_to_kqueue(worker_queue_fd, (uintptr_t)peer->fd, EVFILT_READ,
+                          EV_ADD | EV_DISPATCH, 0, 0, peer);
 
-            inet_ntop(af, peer_data[idx].raw_addr_ptr, peer_data[idx].ascii_addr,
-                      sizeof(peer_data[idx].ascii_addr));
+            printf("[INFO] New connection from %s:%u\n", peer->ascii_addr, peer->port);
 
-            printf("[INFO] New connection from %s:%u\n", peer_data[idx].ascii_addr,
-                   peer_data[idx].port);
-
-            peer_data[idx].is_connected = 1;
-            peer_data[idx].fd = new_fd;
-
-            EV_SET(&events[0], new_fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0,
-                   &peer_data[idx]);
-
-            if (kevent(worker_queue_fd, events, 1, NULL, 0, NULL) == -1)
-                fatal("kevent()");
-
-            // Look for another free peer
-            int tmp = idx;
-            for (int j = idx; j < max_num_active_conn; ++j) {
-                if (!peer_data[j].is_connected) {
-                    idx = j;
-                    break;
-                }
-            }
-
-            if (tmp != idx)
+            peer = get_free_peer(peer_ptrs, max_num_active_conn);
+            if (peer != NULL)
                 continue;
 
-            for (int j = 0; j < idx; ++j) {
-                if (!peer_data[j].is_connected) {
-                    idx = j;
-                    break;
-                }
-            }
-
-            if (tmp != idx)
-                continue;
-
-            // No free slots, reallocate...
-            err = pthread_rwlock_wrlock(&worker_data.rwlock);
-            if (err != 0)
-                fatal3("pthread_rwlock_wrlock()", err);
-
+            // No unconnected peers, reallocate...
             max_num_active_conn *= 2;
-            peer_data = realloc(peer_data, (size_t)max_num_active_conn);
-            if (peer_data == NULL)
+
+            peer_ptrs = realloc(peer_ptrs, (size_t)max_num_active_conn);
+            if (peer_ptrs == NULL)
                 fatal("realloc()");
 
-            struct kevent *events2 = calloc((size_t)max_num_active_conn,
-                                            sizeof(*events2));
-            if (events2 == NULL)
-                fatal("malloc()");
+            for (int j = max_num_active_conn / 2; j < max_num_active_conn; ++j) {
+                peer_ptrs[j] = malloc(sizeof(*peer_ptrs[j]));
+                if (peer_ptrs[j] == NULL)
+                    fatal("malloc()");
 
-            int num_new_events = 0;
-            for (int j = 0; j < max_num_active_conn; ++j)
-                if (peer_data[j].is_connected)
-                    EV_SET(&events2[num_new_events++], peer_data[j].fd,
-                           EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, &peer_data[j]);
+                peer_ptrs[j]->is_connected = 0;
+            }
 
-            if (kevent(worker_queue_fd, events2, num_new_events, NULL, 0, NULL) == -1)
-                fatal("kevent()");
+            peer = peer_ptrs[max_num_active_conn / 2];
 
-            free(events2);
-
-            for (int j = 0; j < max_num_active_conn; ++j)
-                if (!peer_data[j].is_connected) {
-                    idx = j;
-                    break;
-                }
-
-            worker_data.realloc_cnt += num_threads;
-
-            err = pthread_rwlock_unlock(&worker_data.rwlock);
-            if (err != 0)
-                fatal3("pthread_rwlock_unlock()", err);
+            ATOMIC_STORE(worker_data.num_events, max_num_active_conn + 2);
         }
     }
-
-wait_for_thread_termination:;
-    printf("Waiting for worker threads to quit...\n");
-
-    struct timespec timeout = {
-        .tv_sec = 10,
-        .tv_nsec = 0
-    };
-
-    for (;;) {
-        int num = kevent(thread_term_queue_fd, NULL, 0, events, 1, &timeout);
-        if (num == -1)
-            fatal("kevent()");
-
-        if (num == 0) {
-            // Time's up!
-            printf("Some threads got stuck. Killing those...\n");
-
-            for (int j = 0; j < num_threads; ++j)
-                pthread_cancel(threads[j]);
-
-            goto end;
-        }
-
-        // Some thread(s) shut down
-
-        int thread_fd = (int)events[0].ident;
-        size_t bytes_to_read = (size_t)events[0].data;
-
-        assert(bytes_to_read <= (size_t)num_threads);
-
-        if (read(thread_fd, buf, bytes_to_read) == -1)
-            fatal("read()");
-
-        term_pipe_rem_size -= bytes_to_read;
-        if (term_pipe_rem_size == 0)
-            goto end;
-    }
-
-end:;
-    printf("Shutting down...\n");
-
-    for (int i = 0; i < max_num_active_conn; ++i)
-        if (peer_data[i].is_connected)
-            shutdown(peer_data[i].fd, SHUT_RDWR);
-
-    return 0;
 }
 
 void *handle_signals(void *data)
 {
-    struct signal_handling_thread_data *info = data;
+    struct sigthread_data *info = data;
 
     int cleared_sig;
     int err = sigwait(&info->sigset, &cleared_sig);
@@ -427,18 +274,53 @@ void *handle_signals(void *data)
 
     printf("[INFO] Received SIGINT/SIGTERM\n");
 
-    unsigned char dummy;
-
-    if (write(info->signal_pipe, &dummy, sizeof(dummy)) == -1)
-        fatal("write()");
+    add_to_kqueue(info->main_thread_kqueue, EVENT_SIGNAL_ARRIVED,
+                  EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
 
     return NULL;
+}
+
+int create_socket(in_port_t port, struct sockaddr_storage *sockaddr, socklen_t *len)
+{
+    int sockfd;
+
+    sockfd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        if (errno != EAFNOSUPPORT)
+            fatal("socket()");
+
+        // No IPv6, so...
+
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd == -1)
+            fatal("socket()");
+
+        *(struct sockaddr_in *)sockaddr = (struct sockaddr_in){
+            .sin_family = AF_INET,
+            .sin_addr = {
+                .s_addr = INADDR_ANY
+            },
+            .sin_port = htons(port)
+        };
+
+        *len = sizeof(struct sockaddr_in);
+    } else {
+        *(struct sockaddr_in6 *)sockaddr = (struct sockaddr_in6){
+            .sin6_family = AF_INET6,
+            .sin6_addr = in6addr_any,
+            .sin6_port = htons(port)
+        };
+
+        *len = sizeof(struct sockaddr_in6);
+    }
+
+    return sockfd;
 }
 
 void *worker_thread(void *data)
 {
     struct worker_data *info = data;
-    int kqueue = info->kqueue;
+    int kqueue = info->active_conn_kqueue;
     int num_revents = info->num_events;
 
     struct kevent *revents = calloc((size_t)num_revents, sizeof(*revents));
@@ -450,16 +332,21 @@ void *worker_thread(void *data)
     if (buffer == NULL)
         fatal("malloc()");
 
+    struct kevent *events = calloc((size_t)num_revents, sizeof(*events));
+    if (events == NULL)
+        fatal("calloc()");
+
     int re_add_event = 0;
     struct kevent *event_ptr = NULL;
-    int old_realloc_cnt = 0;
 
     for (;;) {
-    kevent_again:;
         int events_recvd = kevent(kqueue, event_ptr, re_add_event,
                                   revents, num_revents, NULL);
         if (events_recvd == -1)
             fatal("kevent()");
+
+        re_add_event = 0;
+        event_ptr = NULL;
 
         for (int i = 0; i < events_recvd; ++i) {
             if (revents[i].flags & EV_ERROR)
@@ -467,52 +354,20 @@ void *worker_thread(void *data)
 
             assert(revents[i].filter = EVFILT_READ);
 
-            int fd = (int)revents[i].ident;
-
-            if (fd == info->signal_pipe) {
-                printf("[INFO] Worker thread shutting down\n");
-
-                unsigned char t;
-                if (write(info->term_pipe, &t, sizeof(t)) == -1)
-                    fatal("write()");
-
-                return NULL;
-            }
-
-            int err = pthread_rwlock_rdlock(&info->rwlock);
-            if (err != 0)
-                fatal3("pthread_rwlock_rdlock()", err);
-
-
-            if (info->realloc_cnt > old_realloc_cnt) {
-                num_revents *= 2;
-
-                revents = realloc(revents, (size_t)num_revents);
-                if (revents == NULL)
-                    fatal("realloc()");
-
-                old_realloc_cnt = --info->realloc_cnt;
-
-                err = pthread_rwlock_unlock(&info->rwlock);
-                if (err != 0)
-                    fatal3("pthread_rwlock_unlock()", err);
-
-                goto kevent_again;
-            }
-
             struct peer_data *peer_data = revents[i].udata;
+            assert((int)revents[i].ident == peer_data->fd);
+
             size_t bytes_to_read = (size_t)revents[i].data;
 
             if (revents[i].data == 0 && revents[i].flags & EV_EOF) {
                 printf("Lost connection with %s:%u\n", peer_data->ascii_addr,
                        peer_data->port);
 
-                if (close(fd) == -1)
+                if (close(peer_data->fd) == -1)
                     fatal("close()");
 
-                peer_data->is_connected = 0;
-                re_add_event = 0;
-                event_ptr = NULL;
+                ATOMIC_STORE(peer_data->is_connected, 0);
+
                 continue;
             }
 
@@ -526,7 +381,7 @@ void *worker_thread(void *data)
                     fatal("realloc()");
             }
 
-            ssize_t bytes_read = read(fd, buffer, bytes_to_read);
+            ssize_t bytes_read = read(peer_data->fd, buffer, bytes_to_read);
             if (bytes_read == -1)
                 fatal("read()");
 
@@ -537,19 +392,69 @@ void *worker_thread(void *data)
 
             printf("\n[END DATA]\n");
 
-            struct kevent event[1];
-            EV_SET(&event[0], revents[i].ident, revents[i].filter, revents[i].flags,
-                   revents[i].fflags, revents[i].data, revents[i].udata);
-            event_ptr = event;
-            re_add_event = 1;
+            EV_SET(&events[re_add_event++], revents[i].ident, revents[i].filter,
+                   EV_ENABLE, revents[i].fflags, revents[i].data, revents[i].udata);
+            event_ptr = events;
+        }
 
-            err = pthread_rwlock_unlock(&info->rwlock);
-            if (err != 0)
-                fatal3("pthread_rwlock_unlock()", err);
+        int new_num_events = ATOMIC_LOAD(info->num_events);
+
+        if (new_num_events != num_revents) {
+            num_revents = new_num_events;
+
+            revents = realloc(revents, (size_t)num_revents);
+            if (revents == NULL)
+                fatal("realloc()");
+
+            events = realloc(events, (size_t)num_revents);
+            if (events == NULL)
+                fatal("realloc()");
         }
     }
 }
 
+void accept_conn(int fd, struct peer_data *peer)
+{
+    socklen_t size = sizeof(peer->sockaddr);
+    int new_fd = accept(fd, (struct sockaddr *)&peer->sockaddr, &size);
+    if (new_fd == -1)
+        fatal("accept()");
+
+    int af = peer->sockaddr.ss_family;
+    switch (af) {
+        case AF_INET:
+            peer->ip4_addr_ptr = &((struct sockaddr_in *)&peer->sockaddr)->sin_addr;
+            peer->port = ((struct sockaddr_in *)&peer->sockaddr)->sin_port;
+            break;
+        case AF_INET6:
+            peer->ip6_addr_ptr = &((struct sockaddr_in6 *)&peer->sockaddr)->sin6_addr;
+            peer->port = ((struct sockaddr_in6 *)&peer->sockaddr)->sin6_port;
+            break;
+    }
+
+    inet_ntop(af, peer->raw_addr_ptr, peer->ascii_addr, sizeof(peer->ascii_addr));
+
+    peer->is_connected = 1;
+    peer->fd = new_fd;
+}
+
+void add_to_kqueue(int fd, uintptr_t ident, int16_t filter, uint16_t flags,
+                   uint32_t fflags, intptr_t data, void *udata)
+{
+    struct kevent event;
+    EV_SET(&event, ident, filter, flags, fflags, data, udata);
+    if (kevent(fd, &event, 1, NULL, 0, NULL) == -1)
+        fatal("kevent()");
+}
+
+struct peer_data *get_free_peer(struct peer_data *const *peer_ptrs, int max)
+{
+    for (int i = 0; i < max; ++i)
+        if (!ATOMIC_LOAD(peer_ptrs[i]->is_connected))
+            return (struct peer_data *)peer_ptrs[i];
+
+    return NULL;
+}
 
 void fatal(const char *msg)
 {
