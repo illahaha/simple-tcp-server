@@ -72,7 +72,7 @@ struct worker_data {
     int num_events;
     int signal_pipe; // Got SIGINT/SIGTERM -> terminate self
     int term_pipe; // Notify main thread of graceful termination
-    int realloc_pipe; // Thread has to realloc event array
+    int realloc_cnt; // XXX: Should be atomic
 };
 
 struct signal_handling_thread_data {
@@ -185,15 +185,10 @@ int main(int argc, const char *argv[])
 
     struct kevent events[2]; // gets reused throughout
 
-    int realloc_pipe_fds[2];
-    if (pipe(realloc_pipe_fds) == -1)
-        fatal("pipe()");
-
     // Workers will get notfied of arrived signals through pipe
     EV_SET(&events[0], signal_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
-    EV_SET(&events[1], realloc_pipe_fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
 
-    if (kevent(worker_queue_fd, events, 2, NULL, 0, NULL) == -1)
+    if (kevent(worker_queue_fd, events, 1, NULL, 0, NULL) == -1)
         fatal("kevent()");
 
     int term_pipe_fds[2];
@@ -206,7 +201,7 @@ int main(int argc, const char *argv[])
         .signal_pipe = signal_pipe_fds[0],
         .term_pipe = term_pipe_fds[1],
         .rwlock = PTHREAD_RWLOCK_INITIALIZER,
-        .realloc_pipe = realloc_pipe_fds[0]
+        .realloc_cnt = 0
     };
 
     int num_threads = MIN(get_num_cpus(), backlog);
@@ -363,10 +358,7 @@ int main(int argc, const char *argv[])
                     break;
                 }
 
-            int new_len = max_num_active_conn + 2;
-            for (int j = 0; j < num_threads; ++j)
-                if (write(realloc_pipe_fds[1], &new_len, sizeof(new_len)) == -1)
-                    fatal("write()");
+            worker_data.realloc_cnt += num_threads;
 
             err = pthread_rwlock_unlock(&worker_data.rwlock);
             if (err != 0)
@@ -460,6 +452,7 @@ void *worker_thread(void *data)
 
     int re_add_event = 0;
     struct kevent *event_ptr = NULL;
+    int old_realloc_cnt = 0;
 
     for (;;) {
     kevent_again:;
@@ -486,20 +479,26 @@ void *worker_thread(void *data)
                 return NULL;
             }
 
-            if (fd == info->realloc_pipe) {
-                if (read(info->realloc_pipe, &num_revents, sizeof(num_revents)) == -1)
-                    fatal("read()");
+            int err = pthread_rwlock_rdlock(&info->rwlock);
+            if (err != 0)
+                fatal3("pthread_rwlock_rdlock()", err);
+
+
+            if (info->realloc_cnt > old_realloc_cnt) {
+                num_revents *= 2;
 
                 revents = realloc(revents, (size_t)num_revents);
                 if (revents == NULL)
                     fatal("realloc()");
 
+                old_realloc_cnt = --info->realloc_cnt;
+
+                err = pthread_rwlock_unlock(&info->rwlock);
+                if (err != 0)
+                    fatal3("pthread_rwlock_unlock()", err);
+
                 goto kevent_again;
             }
-
-            int err = pthread_rwlock_rdlock(&info->rwlock);
-            if (err != 0)
-                fatal3("pthread_rwlock_rdlock()", err);
 
             struct peer_data *peer_data = revents[i].udata;
             size_t bytes_to_read = (size_t)revents[i].data;
