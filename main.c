@@ -172,7 +172,7 @@ int main(int argc, const char *argv[])
 
     struct worker_data worker_data = {
         .active_conn_kqueue = worker_queue_fd,
-        .num_events = max_num_active_conn + 2
+        .num_events = max_num_active_conn
     };
 
     int num_threads = MIN(get_num_cpus(), backlog);
@@ -236,13 +236,14 @@ int main(int argc, const char *argv[])
                 continue;
 
             // No unconnected peers, reallocate...
+            int old_size = max_num_active_conn;
             max_num_active_conn *= 2;
 
             peer_ptrs = realloc(peer_ptrs, (size_t)max_num_active_conn);
             if (peer_ptrs == NULL)
                 fatal("realloc()");
 
-            for (int j = max_num_active_conn / 2; j < max_num_active_conn; ++j) {
+            for (int j = old_size; j < max_num_active_conn; ++j) {
                 peer_ptrs[j] = malloc(sizeof(*peer_ptrs[j]));
                 if (peer_ptrs[j] == NULL)
                     fatal("malloc()");
@@ -250,9 +251,9 @@ int main(int argc, const char *argv[])
                 peer_ptrs[j]->is_connected = 0;
             }
 
-            idx = max_num_active_conn / 2;
+            idx = old_size;
 
-            ATOMIC_STORE(worker_data.num_events, max_num_active_conn + 2);
+            ATOMIC_STORE(worker_data.num_events, max_num_active_conn);
         }
     }
 }
@@ -323,14 +324,14 @@ void *worker_thread(void *data)
     if (revents == NULL)
         fatal("calloc()");
 
+    struct kevent *events = calloc((size_t)num_revents, sizeof(*events));
+    if (events == NULL)
+        fatal("calloc()");
+
     size_t bufsiz = 8192; // Should be big enough for most things
     unsigned char *buffer = malloc(bufsiz);
     if (buffer == NULL)
         fatal("malloc()");
-
-    struct kevent *events = calloc((size_t)num_revents, sizeof(*events));
-    if (events == NULL)
-        fatal("calloc()");
 
     int re_add_event = 0;
     struct kevent *event_ptr = NULL;
@@ -350,25 +351,24 @@ void *worker_thread(void *data)
 
             assert(revents[i].filter = EVFILT_READ);
 
-            struct peer_data *peer_data = revents[i].udata;
-            assert((int)revents[i].ident == peer_data->fd);
+            struct peer_data *peer = revents[i].udata;
+            assert((int)revents[i].ident == peer->fd);
 
             size_t bytes_to_read = (size_t)revents[i].data;
 
             if (revents[i].data == 0 && revents[i].flags & EV_EOF) {
-                printf("Lost connection with %s:%u\n", peer_data->ascii_addr,
-                       peer_data->port);
+                printf("Lost connection with %s:%u\n", peer->ascii_addr, peer->port);
 
-                if (close(peer_data->fd) == -1)
+                if (close(peer->fd) == -1)
                     fatal("close()");
 
-                ATOMIC_STORE(peer_data->is_connected, 0);
+                ATOMIC_STORE(peer->is_connected, 0);
 
                 continue;
             }
 
-            printf("[INFO] %s:%u sent %zu bytes\n", peer_data->ascii_addr,
-                   peer_data->port, bytes_to_read);
+            printf("[INFO] %s:%u sent %zu bytes\n", peer->ascii_addr,
+                peer->port, bytes_to_read);
 
             if (bytes_to_read > bufsiz) {
                 bufsiz = bytes_to_read;
@@ -377,7 +377,7 @@ void *worker_thread(void *data)
                     fatal("realloc()");
             }
 
-            ssize_t bytes_read = read(peer_data->fd, buffer, bytes_to_read);
+            ssize_t bytes_read = read(peer->fd, buffer, bytes_to_read);
             if (bytes_read == -1)
                 fatal("read()");
 
@@ -418,14 +418,16 @@ void accept_conn(int fd, struct peer_data *peer)
 
     int af = peer->sockaddr.ss_family;
     switch (af) {
-        case AF_INET:
-            peer->ip4_addr_ptr = &((struct sockaddr_in *)&peer->sockaddr)->sin_addr;
-            peer->port = ((struct sockaddr_in *)&peer->sockaddr)->sin_port;
-            break;
-        case AF_INET6:
-            peer->ip6_addr_ptr = &((struct sockaddr_in6 *)&peer->sockaddr)->sin6_addr;
-            peer->port = ((struct sockaddr_in6 *)&peer->sockaddr)->sin6_port;
-            break;
+        case AF_INET: {
+            struct sockaddr_in *addr = (void *)&peer->sockaddr;
+            peer->ip4_addr_ptr = &addr->sin_addr;
+            peer->port = addr->sin_port;
+            break; }
+        case AF_INET6: {
+            struct sockaddr_in6 *addr = (void *)&peer->sockaddr;
+            peer->ip6_addr_ptr = &addr->sin6_addr;
+            peer->port = addr->sin6_port;
+            break; }
     }
 
     inet_ntop(af, peer->raw_addr_ptr, peer->ascii_addr, sizeof(peer->ascii_addr));
