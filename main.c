@@ -86,7 +86,7 @@ static void accept_conn(int fd, struct peer_data *peer);
 static void add_to_kqueue(int fd, uintptr_t ident, int16_t filter, uint16_t flags,
                           uint32_t fflags, intptr_t data, void *udata);
 
-static struct peer_data *get_free_peer(struct peer_data *const *peer_ptrs, int max);
+static int get_free_peer(struct peer_data *const *peer_ptrs, int max, int hint);
 
 static int create_socket(in_port_t port, struct sockaddr_storage *sockaddr, socklen_t *len);
 
@@ -191,9 +191,7 @@ int main(int argc, const char *argv[])
             fatal3("pthread_detach()", err);
     }
 
-    struct peer_data *peer = peer_ptrs[0];
-
-    for (;;) {
+    for (int idx = 0; ;) {
         struct kevent revents[2];
         int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 2, NULL);
         if (events_triggered == -1)
@@ -220,6 +218,8 @@ int main(int argc, const char *argv[])
 
             // Got new connection
 
+            struct peer_data *peer = peer_ptrs[idx];
+
             assert(revents[i].filter == EVFILT_READ);
             assert((int)revents[i].ident == sockfd);
             assert(!ATOMIC_LOAD(peer->is_connected));
@@ -231,8 +231,8 @@ int main(int argc, const char *argv[])
 
             printf("[INFO] New connection from %s:%u\n", peer->ascii_addr, peer->port);
 
-            peer = get_free_peer(peer_ptrs, max_num_active_conn);
-            if (peer != NULL)
+            idx = get_free_peer(peer_ptrs, max_num_active_conn, idx);
+            if (idx != -1)
                 continue;
 
             // No unconnected peers, reallocate...
@@ -250,7 +250,7 @@ int main(int argc, const char *argv[])
                 peer_ptrs[j]->is_connected = 0;
             }
 
-            peer = peer_ptrs[max_num_active_conn / 2];
+            idx = max_num_active_conn / 2;
 
             ATOMIC_STORE(worker_data.num_events, max_num_active_conn + 2);
         }
@@ -443,13 +443,17 @@ void add_to_kqueue(int fd, uintptr_t ident, int16_t filter, uint16_t flags,
         fatal("kevent()");
 }
 
-struct peer_data *get_free_peer(struct peer_data *const *peer_ptrs, int max)
+int get_free_peer(struct peer_data *const *peer_ptrs, int max, int hint)
 {
-    for (int i = 0; i < max; ++i)
+    for (int i = hint; i < max; ++i)
         if (!ATOMIC_LOAD(peer_ptrs[i]->is_connected))
-            return (struct peer_data *)peer_ptrs[i];
+            return i;
 
-    return NULL;
+    for (int i = 0; i < hint; ++i)
+        if (!ATOMIC_LOAD(peer_ptrs[i]->is_connected))
+            return i;
+
+    return -1;
 }
 
 void fatal(const char *msg)
