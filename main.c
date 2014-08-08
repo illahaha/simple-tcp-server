@@ -39,7 +39,7 @@
 #define EVENT_SIGNAL_ARRIVED 1
 
 #define ATOMIC_LOAD(x) __atomic_load_n(&(x), __ATOMIC_SEQ_CST)
-#define ATOMIC_STORE(x, y) __atomic_store_n(&x, y, __ATOMIC_SEQ_CST)
+#define ATOMIC_STORE(x, y) __atomic_store_n(&(x), (y), __ATOMIC_SEQ_CST)
 
 struct peer_data {
     struct sockaddr_storage sockaddr;
@@ -213,7 +213,7 @@ int main(int argc, const char *argv[])
                     if (peer_ptrs[j]->is_connected)
                         shutdown(peer_ptrs[j]->fd, SHUT_RDWR);
 
-                exit(EXIT_SUCCESS);
+                return 0;
             }
 
             // Got new connection
