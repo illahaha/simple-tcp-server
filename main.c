@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <netdb.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -59,9 +60,9 @@ struct worker_data {
 
 static noreturn void fatal(const char *msg);
 static noreturn void fatal2(const char *msg);
-static noreturn void fatal3(const char *msg, int err);
+static noreturn void fatal_strerror(const char *msg, int err);
+static noreturn void fatal_gai(const char *msg, int err);
 
-static unsigned short str_to_ushort(const char *str, int base);
 static int str_to_int(const char *str, int base);
 
 static int get_num_cpus(void);
@@ -76,24 +77,18 @@ static void add_to_kqueue(int fd, uintptr_t ident, int16_t filter, uint16_t flag
 
 static int get_free_peer(struct peer *const *peer_ptrs, int max, int hint);
 
-static int create_socket(in_port_t port, struct sockaddr_storage *sockaddr, socklen_t *len);
-
 int main(int argc, const char *argv[])
 {
     if (argc < 2)
         fatal2("Missing port number as argument");
-
-    in_port_t port = str_to_ushort(argv[1], 0);
 
     int somaxconn = get_somaxconn();
     int backlog = somaxconn;
     if (argc == 3) {
         backlog = str_to_int(argv[2], 0);
 
-        if (backlog == 0) {
-            fprintf(stderr, "Backlog has to be bigger than 0.\n");
-            return 1;
-        }
+        if (backlog == 0)
+            fatal2("Backlog has to be bigger than 0.\n");
 
         if (backlog > somaxconn) {
             fprintf(stderr, "Backlog exceeds kern.ipc.somaxconn, truncating...\n");
@@ -101,12 +96,27 @@ int main(int argc, const char *argv[])
         }
     }
 
-    struct sockaddr_storage sockaddr;
-    socklen_t len;
-    int sockfd = create_socket(port, &sockaddr, &len);
+    struct addrinfo hints = {
+        .ai_flags = AI_ADDRCONFIG | AI_PASSIVE,
+        .ai_family = PF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+        .ai_protocol = IPPROTO_TCP
+    };
 
-    if (bind(sockfd, (struct sockaddr *)&sockaddr, len) == -1)
+    struct addrinfo *addrinfo;
+
+    int err = getaddrinfo(NULL, argv[1], &hints, &addrinfo);
+    if (err != 0)
+        fatal_gai("getaddrinfo()", err);
+
+    int sockfd = socket(addrinfo->ai_family, addrinfo->ai_socktype, addrinfo->ai_protocol);
+    if (sockfd == -1)
+        fatal("socket()");
+
+    if (bind(sockfd, addrinfo->ai_addr, addrinfo->ai_addrlen) == -1)
         fatal("bind()");
+
+    freeaddrinfo(addrinfo);
 
     if (listen(sockfd, backlog) == -1)
         fatal("listen()");
@@ -141,13 +151,13 @@ int main(int argc, const char *argv[])
         fatal("calloc()");
 
     for (int i = 0; i < num_threads; ++i) {
-        int err = pthread_create(&threads[i], NULL, worker_thread, &worker_data);
+        err = pthread_create(&threads[i], NULL, worker_thread, &worker_data);
         if (err != 0)
-            fatal3("pthread_create()", err);
+            fatal_strerror("pthread_create()", err);
 
         err = pthread_detach(threads[i]);
         if (err != 0)
-            fatal3("pthread_detach()", err);
+            fatal_strerror("pthread_detach()", err);
     }
 
     if (signal(SIGINT, SIG_IGN) == SIG_ERR)
@@ -171,7 +181,7 @@ int main(int argc, const char *argv[])
 
         for (int i = 0; i < events_triggered; ++i) {
             if (revents[i].flags & EV_ERROR)
-                fatal3("Error processing events", (int)revents[i].data);
+                fatal_strerror("Error processing events", (int)revents[i].data);
 
             if (revents[i].filter == EVFILT_SIGNAL) {
                 printf("[INFO] Got signal!\n");
@@ -231,43 +241,6 @@ int main(int argc, const char *argv[])
     }
 }
 
-int create_socket(in_port_t port, struct sockaddr_storage *sockaddr, socklen_t *len)
-{
-    int sockfd;
-
-    sockfd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (sockfd == -1) {
-        if (errno != EAFNOSUPPORT)
-            fatal("socket()");
-
-        // No IPv6, so...
-
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd == -1)
-            fatal("socket()");
-
-        *(struct sockaddr_in *)sockaddr = (struct sockaddr_in){
-            .sin_family = AF_INET,
-            .sin_addr = {
-                .s_addr = INADDR_ANY
-            },
-            .sin_port = htons(port)
-        };
-
-        *len = sizeof(struct sockaddr_in);
-    } else {
-        *(struct sockaddr_in6 *)sockaddr = (struct sockaddr_in6){
-            .sin6_family = AF_INET6,
-            .sin6_addr = in6addr_any,
-            .sin6_port = htons(port)
-        };
-
-        *len = sizeof(struct sockaddr_in6);
-    }
-
-    return sockfd;
-}
-
 void *worker_thread(void *data)
 {
     struct worker_data *info = data;
@@ -301,7 +274,7 @@ void *worker_thread(void *data)
 
         for (int i = 0; i < events_recvd; ++i) {
             if (revents[i].flags & EV_ERROR)
-                fatal3("Error processing events", (int)revents[i].data);
+                fatal_strerror("Error processing events", (int)revents[i].data);
 
             assert(revents[i].filter = EVFILT_READ);
 
@@ -424,23 +397,16 @@ void fatal2(const char *msg)
     exit(EXIT_FAILURE);
 }
 
-void fatal3(const char *msg, int err)
+void fatal_strerror(const char *msg, int err)
 {
     fprintf(stderr, "%s: %s\n", msg, strerror(err));
     exit(EXIT_FAILURE);
 }
 
-unsigned short str_to_ushort(const char *str, int base)
+void fatal_gai(const char *msg, int err)
 {
-    char *endptr;
-    unsigned long ret = strtoul(str, &endptr, base);
-    if (errno != 0)
-        fatal("strtoul()");
-    if (ret > USHRT_MAX)
-        fatal3("strtoul()", ERANGE);
-    if (*endptr != '\0')
-        fatal2("String to unsigned short conversion: encountered garbage");
-    return (unsigned short)ret;
+    fprintf(stderr, "%s: %s\n", msg, gai_strerror(err));
+    exit(EXIT_FAILURE);
 }
 
 int str_to_int(const char *str, int base)
@@ -450,7 +416,7 @@ int str_to_int(const char *str, int base)
     if (errno != 0)
         fatal("strtol()");
     if (ret > INT_MAX || ret < INT_MIN)
-        fatal3("strtol()", ERANGE);
+        fatal_strerror("strtol()", ERANGE);
     if (*endptr != '\0')
         fatal2("String to int conversion: encountered garbage");
     return (int)ret;
