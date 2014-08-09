@@ -36,12 +36,10 @@
 
 #include <arpa/inet.h>
 
-#define EVENT_SIGNAL_ARRIVED 1
-
 #define ATOMIC_LOAD(x) __atomic_load_n(&(x), __ATOMIC_SEQ_CST)
 #define ATOMIC_STORE(x, y) __atomic_store_n(&(x), (y), __ATOMIC_SEQ_CST)
 
-struct peer_data {
+struct peer {
     struct sockaddr_storage sockaddr;
     union {
         void *raw_addr_ptr;
@@ -59,34 +57,24 @@ struct worker_data {
     int num_events;
 };
 
-struct sigthread_data {
-    int main_thread_kqueue;
-    sigset_t sigset;
-};
-
 static noreturn void fatal(const char *msg);
 static noreturn void fatal2(const char *msg);
 static noreturn void fatal3(const char *msg, int err);
 
-static unsigned short strtous(const char *restrict str, char **restrict endptr,
-                              int base);
-static int strtoi(const char *restrict str, char **restrict endptr, int base);
 static unsigned short str_to_ushort(const char *str, int base);
 static int str_to_int(const char *str, int base);
 
 static int get_num_cpus(void);
 static int get_somaxconn(void);
 
-static void *handle_signals(void *data);
-
 static void *worker_thread(void *data);
 
-static void accept_conn(int fd, struct peer_data *peer);
+static void accept_conn(int fd, struct peer *peer);
 
 static void add_to_kqueue(int fd, uintptr_t ident, int16_t filter, uint16_t flags,
                           uint32_t fflags, intptr_t data, void *udata);
 
-static int get_free_peer(struct peer_data *const *peer_ptrs, int max, int hint);
+static int get_free_peer(struct peer *const *peer_ptrs, int max, int hint);
 
 static int create_socket(in_port_t port, struct sockaddr_storage *sockaddr, socklen_t *len);
 
@@ -125,7 +113,7 @@ int main(int argc, const char *argv[])
 
     int max_num_active_conn = backlog;
 
-    struct peer_data **peer_ptrs = calloc((size_t)max_num_active_conn, sizeof(*peer_ptrs));
+    struct peer **peer_ptrs = calloc((size_t)max_num_active_conn, sizeof(*peer_ptrs));
     if (peer_ptrs == NULL)
         fatal("calloc()");
 
@@ -141,35 +129,6 @@ int main(int argc, const char *argv[])
     if (worker_queue_fd == -1)
         fatal("kqueue()");
 
-    int accept_queue_fd = kqueue();
-    if (accept_queue_fd == -1)
-        fatal("kqueue()");
-
-    add_to_kqueue(accept_queue_fd, EVENT_SIGNAL_ARRIVED, EVFILT_USER, EV_ADD, 0, 0, NULL);
-    add_to_kqueue(accept_queue_fd, (uintptr_t)sockfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-
-    // Stuff for handling signals in its own thread
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
-    if (pthread_sigmask(SIG_SETMASK, &set, NULL) == -1)
-        fatal("pthread_sigmask()");
-
-    struct sigthread_data sig_handling_data = {
-        .main_thread_kqueue = accept_queue_fd,
-        .sigset = set
-    };
-
-    pthread_t signal_handling_thread;
-    int err = pthread_create(&signal_handling_thread, NULL, handle_signals, &sig_handling_data);
-    if (err != 0)
-        fatal3("pthread_create()", err);
-
-    err = pthread_detach(signal_handling_thread);
-    if (err != 0)
-        fatal3("pthread_detach()", err);
-
     struct worker_data worker_data = {
         .active_conn_kqueue = worker_queue_fd,
         .num_events = max_num_active_conn
@@ -182,7 +141,7 @@ int main(int argc, const char *argv[])
         fatal("calloc()");
 
     for (int i = 0; i < num_threads; ++i) {
-        err = pthread_create(&threads[i], NULL, worker_thread, &worker_data);
+        int err = pthread_create(&threads[i], NULL, worker_thread, &worker_data);
         if (err != 0)
             fatal3("pthread_create()", err);
 
@@ -191,9 +150,22 @@ int main(int argc, const char *argv[])
             fatal3("pthread_detach()", err);
     }
 
+    if (signal(SIGINT, SIG_IGN) == SIG_ERR)
+        fatal("signal()");
+    if (signal(SIGTERM, SIG_IGN) == SIG_ERR)
+        fatal("signal()");
+
+    int accept_queue_fd = kqueue();
+    if (accept_queue_fd == -1)
+        fatal("kqueue()");
+
+    add_to_kqueue(accept_queue_fd, SIGINT, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+    add_to_kqueue(accept_queue_fd, SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+    add_to_kqueue(accept_queue_fd, (uintptr_t)sockfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+
     for (int idx = 0; ;) {
-        struct kevent revents[2];
-        int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 2, NULL);
+        struct kevent revents[3];
+        int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 3, NULL);
         if (events_triggered == -1)
             fatal("kevent()");
 
@@ -201,8 +173,8 @@ int main(int argc, const char *argv[])
             if (revents[i].flags & EV_ERROR)
                 fatal3("Error processing events", (int)revents[i].data);
 
-            if (revents[i].filter == EVFILT_USER) {
-                assert(revents[i].ident == EVENT_SIGNAL_ARRIVED);
+            if (revents[i].filter == EVFILT_SIGNAL) {
+                printf("[INFO] Got signal!\n");
 
                 for (int j = 0; j < num_threads; ++j)
                     pthread_cancel(threads[j]);
@@ -218,10 +190,11 @@ int main(int argc, const char *argv[])
 
             // Got new connection
 
-            struct peer_data *peer = peer_ptrs[idx];
-
             assert(revents[i].filter == EVFILT_READ);
             assert((int)revents[i].ident == sockfd);
+
+            struct peer *peer = peer_ptrs[idx];
+
             assert(!ATOMIC_LOAD(peer->is_connected));
 
             accept_conn(sockfd, peer);
@@ -256,25 +229,6 @@ int main(int argc, const char *argv[])
             ATOMIC_STORE(worker_data.num_events, max_num_active_conn);
         }
     }
-}
-
-void *handle_signals(void *data)
-{
-    struct sigthread_data *info = data;
-
-    int cleared_sig;
-    int err = sigwait(&info->sigset, &cleared_sig);
-    if (err != 0)
-        fatal3("sigwait()", err);
-
-    assert(cleared_sig == SIGINT || cleared_sig == SIGTERM);
-
-    printf("[INFO] Received SIGINT/SIGTERM\n");
-
-    add_to_kqueue(info->main_thread_kqueue, EVENT_SIGNAL_ARRIVED,
-                  EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
-
-    return NULL;
 }
 
 int create_socket(in_port_t port, struct sockaddr_storage *sockaddr, socklen_t *len)
@@ -351,7 +305,7 @@ void *worker_thread(void *data)
 
             assert(revents[i].filter = EVFILT_READ);
 
-            struct peer_data *peer = revents[i].udata;
+            struct peer *peer = revents[i].udata;
             assert((int)revents[i].ident == peer->fd);
 
             size_t bytes_to_read = (size_t)revents[i].data;
@@ -409,7 +363,7 @@ void *worker_thread(void *data)
     }
 }
 
-void accept_conn(int fd, struct peer_data *peer)
+void accept_conn(int fd, struct peer *peer)
 {
     socklen_t size = sizeof(peer->sockaddr);
     int new_fd = accept(fd, (struct sockaddr *)&peer->sockaddr, &size);
@@ -445,7 +399,7 @@ void add_to_kqueue(int fd, uintptr_t ident, int16_t filter, uint16_t flags,
         fatal("kevent()");
 }
 
-int get_free_peer(struct peer_data *const *peer_ptrs, int max, int hint)
+int get_free_peer(struct peer *const *peer_ptrs, int max, int hint)
 {
     for (int i = hint; i < max; ++i)
         if (!ATOMIC_LOAD(peer_ptrs[i]->is_connected))
@@ -476,70 +430,30 @@ void fatal3(const char *msg, int err)
     exit(EXIT_FAILURE);
 }
 
-unsigned short strtous(const char *restrict str, char **restrict endptr,
-                       int base)
-{
-    errno_t err = errno;
-
-    errno = 0;
-    unsigned long ret = strtoul(str, endptr, base);
-    if (errno != 0)
-        return USHRT_MAX;
-
-    if (ret > USHRT_MAX) {
-        errno = ERANGE;
-        return USHRT_MAX;
-    }
-
-    errno = err;
-
-    return (unsigned short)ret;
-}
-
-int strtoi(const char *restrict str, char **restrict endptr, int base)
-{
-    errno_t err = errno;
-
-    errno = 0;
-    long ret = strtol(str, endptr, base);
-    if (errno != 0)
-        return INT_MAX;
-
-    if (ret > INT_MAX) {
-        errno = ERANGE;
-        return INT_MAX;
-    }
-
-    if (ret < INT_MIN) {
-        errno = ERANGE;
-        return INT_MIN;
-    }
-
-    errno = err;
-
-    return (int)ret;
-}
-
 unsigned short str_to_ushort(const char *str, int base)
 {
     char *endptr;
-    unsigned short ret = strtous(str, &endptr, base);
+    unsigned long ret = strtoul(str, &endptr, base);
     if (errno != 0)
         fatal("strtoul()");
+    if (ret > USHRT_MAX)
+        fatal3("strtoul()", ERANGE);
     if (*endptr != '\0')
         fatal2("String to unsigned short conversion: encountered garbage");
-    return ret;
+    return (unsigned short)ret;
 }
 
 int str_to_int(const char *str, int base)
 {
     char *endptr;
-    int ret = strtoi(str, &endptr, base);
+    long ret = strtol(str, &endptr, base);
     if (errno != 0)
         fatal("strtol()");
+    if (ret > INT_MAX || ret < INT_MIN)
+        fatal3("strtol()", ERANGE);
     if (*endptr != '\0')
         fatal2("String to int conversion: encountered garbage");
-    return ret;
+    return (int)ret;
 }
 
 int get_num_cpus(void)
