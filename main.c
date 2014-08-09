@@ -322,7 +322,7 @@ void *worker_thread(void *data)
             }
 
             printf("[INFO] %s:%u sent %zu bytes\n", peer->ascii_addr,
-                peer->port, bytes_to_read);
+                   peer->port, bytes_to_read);
 
             if (bytes_to_read > bufsiz) {
                 bufsiz = bytes_to_read;
@@ -372,16 +372,16 @@ void accept_conn(int fd, struct peer *peer)
 
     int af = peer->sockaddr.ss_family;
     switch (af) {
-        case AF_INET: {
-            struct sockaddr_in *addr = (void *)&peer->sockaddr;
-            peer->ip4_addr_ptr = &addr->sin_addr;
-            peer->port = addr->sin_port;
-            break; }
-        case AF_INET6: {
-            struct sockaddr_in6 *addr = (void *)&peer->sockaddr;
-            peer->ip6_addr_ptr = &addr->sin6_addr;
-            peer->port = addr->sin6_port;
-            break; }
+    case AF_INET: {
+        struct sockaddr_in *addr = (void *)&peer->sockaddr;
+        peer->ip4_addr_ptr = &addr->sin_addr;
+        peer->port = addr->sin_port;
+        break; }
+    case AF_INET6: {
+        struct sockaddr_in6 *addr = (void *)&peer->sockaddr;
+        peer->ip6_addr_ptr = &addr->sin6_addr;
+        peer->port = addr->sin6_port;
+        break; }
     }
 
     inet_ntop(af, peer->raw_addr_ptr, peer->ascii_addr, sizeof(peer->ascii_addr));
