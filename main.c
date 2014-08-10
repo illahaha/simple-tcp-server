@@ -173,6 +173,8 @@ int main(int argc, const char *argv[])
     add_to_kqueue(accept_queue_fd, SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
     add_to_kqueue(accept_queue_fd, (uintptr_t)sockfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
 
+    fprintf(stderr, "[INFO] Waiting for incoming connections...\n");
+
     for (int idx = 0; ;) {
         struct kevent revents[3];
         int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 3, NULL);
@@ -184,12 +186,12 @@ int main(int argc, const char *argv[])
                 fatal_strerror("Error processing events", (int)revents[i].data);
 
             if (revents[i].filter == EVFILT_SIGNAL) {
-                printf("[INFO] Got signal!\n");
+                fprintf(stderr, "[INFO] Got signal #%d.\n", (int)revents[i].ident);
 
                 for (int j = 0; j < num_threads; ++j)
                     pthread_cancel(threads[j]);
 
-                printf("[INFO] Shutting down...\n");
+                fprintf(stderr, "[INFO] Shutting down...\n");
 
                 for (int j = 0; j < max_num_active_conn; ++j)
                     if (peer_ptrs[j]->is_connected)
@@ -212,7 +214,8 @@ int main(int argc, const char *argv[])
             add_to_kqueue(worker_queue_fd, (uintptr_t)peer->fd, EVFILT_READ,
                           EV_ADD | EV_DISPATCH, 0, 0, peer);
 
-            printf("[INFO] New connection from %s:%u\n", peer->ascii_addr, peer->port);
+            fprintf(stderr, "[INFO] New connection from %s:%u\n",
+                    peer->ascii_addr, peer->port);
 
             idx = get_free_peer(peer_ptrs, max_num_active_conn, idx);
             if (idx != -1)
@@ -284,7 +287,8 @@ void *worker_thread(void *data)
             size_t bytes_to_read = (size_t)revents[i].data;
 
             if (revents[i].data == 0 && revents[i].flags & EV_EOF) {
-                printf("Lost connection with %s:%u\n", peer->ascii_addr, peer->port);
+                fprintf(stderr, "[INFO] Lost connection with %s:%u\n",
+                        peer->ascii_addr, peer->port);
 
                 if (close(peer->fd) == -1)
                     fatal("close()");
@@ -294,8 +298,8 @@ void *worker_thread(void *data)
                 continue;
             }
 
-            printf("[INFO] %s:%u sent %zu bytes\n", peer->ascii_addr,
-                   peer->port, bytes_to_read);
+            fprintf(stderr, "[INFO] %s:%u sent %zu bytes\n", peer->ascii_addr,
+                    peer->port, bytes_to_read);
 
             if (bytes_to_read > bufsiz) {
                 bufsiz = bytes_to_read;
@@ -308,12 +312,12 @@ void *worker_thread(void *data)
             if (bytes_read == -1)
                 fatal("read()");
 
-            printf("[BEGIN DATA]\n");
+            fprintf(stderr, "[BEGIN DATA]\n");
 
             if (write(STDOUT_FILENO, buffer, (size_t)bytes_read) == -1)
                 fatal("write()");
 
-            printf("\n[END DATA]\n");
+            fprintf(stderr, "\n[END DATA]\n");
 
             EV_SET(&events[re_add_event++], revents[i].ident, revents[i].filter,
                    EV_ENABLE, revents[i].fflags, revents[i].data, revents[i].udata);
