@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <signal.h>
+#include <stdbool.h>
 
 #include <pthread.h>
 #include <fcntl.h>
@@ -47,10 +48,11 @@ struct peer {
         struct in_addr *ip4_addr_ptr;
         struct in6_addr *ip6_addr_ptr;
     }; // Points into sockaddr.
-    int is_connected;
     int fd;
     in_port_t port;
+    bool is_connected;
     char ascii_addr[INET6_ADDRSTRLEN];
+    char __pad[3];
 };
 
 struct worker_data {
@@ -132,7 +134,7 @@ int main(int argc, const char *argv[])
         if (peer_ptrs[i] == NULL)
             fatal("malloc()");
 
-        peer_ptrs[i]->is_connected = 0;
+        peer_ptrs[i]->is_connected = false;
     }
 
     int worker_queue_fd = kqueue();
@@ -144,7 +146,7 @@ int main(int argc, const char *argv[])
         .num_events = max_num_active_conn
     };
 
-    int num_threads = MIN(get_num_cpus(), backlog);
+    int num_threads = get_num_cpus();
 
     pthread_t *threads = calloc((size_t)num_threads, sizeof(*threads));
     if (threads == NULL)
@@ -225,16 +227,16 @@ int main(int argc, const char *argv[])
             int old_size = max_num_active_conn;
             max_num_active_conn *= 2;
 
-            peer_ptrs = realloc(peer_ptrs, (size_t)max_num_active_conn);
+            peer_ptrs = reallocf(peer_ptrs, (size_t)max_num_active_conn);
             if (peer_ptrs == NULL)
-                fatal("realloc()");
+                fatal("reallocf()");
 
             for (int j = old_size; j < max_num_active_conn; ++j) {
                 peer_ptrs[j] = malloc(sizeof(*peer_ptrs[j]));
                 if (peer_ptrs[j] == NULL)
                     fatal("malloc()");
 
-                peer_ptrs[j]->is_connected = 0;
+                peer_ptrs[j]->is_connected = false;
             }
 
             idx = old_size;
@@ -264,16 +266,14 @@ void *worker_thread(void *data)
         fatal("malloc()");
 
     int re_add_event = 0;
-    struct kevent *event_ptr = NULL;
 
     for (;;) {
-        int events_recvd = kevent(kqueue, event_ptr, re_add_event,
+        int events_recvd = kevent(kqueue, events, re_add_event,
                                   revents, num_revents, NULL);
         if (events_recvd == -1)
             fatal("kevent()");
 
         re_add_event = 0;
-        event_ptr = NULL;
 
         for (int i = 0; i < events_recvd; ++i) {
             if (revents[i].flags & EV_ERROR)
@@ -293,7 +293,7 @@ void *worker_thread(void *data)
                 if (close(peer->fd) == -1)
                     fatal("close()");
 
-                ATOMIC_STORE(peer->is_connected, 0);
+                ATOMIC_STORE(peer->is_connected, false);
 
                 continue;
             }
@@ -303,9 +303,9 @@ void *worker_thread(void *data)
 
             if (bytes_to_read > bufsiz) {
                 bufsiz = bytes_to_read;
-                buffer = realloc(buffer, bufsiz);
+                buffer = reallocf(buffer, bufsiz);
                 if (buffer == NULL)
-                    fatal("realloc()");
+                    fatal("reallocf()");
             }
 
             ssize_t bytes_read = read(peer->fd, buffer, bytes_to_read);
@@ -321,7 +321,6 @@ void *worker_thread(void *data)
 
             EV_SET(&events[re_add_event++], revents[i].ident, revents[i].filter,
                    EV_ENABLE, revents[i].fflags, revents[i].data, revents[i].udata);
-            event_ptr = events;
         }
 
         int new_num_events = ATOMIC_LOAD(info->num_events);
@@ -329,13 +328,13 @@ void *worker_thread(void *data)
         if (new_num_events != num_revents) {
             num_revents = new_num_events;
 
-            revents = realloc(revents, (size_t)num_revents);
+            revents = reallocf(revents, (size_t)num_revents);
             if (revents == NULL)
-                fatal("realloc()");
+                fatal("reallocf()");
 
-            events = realloc(events, (size_t)num_revents);
+            events = reallocf(events, (size_t)num_revents);
             if (events == NULL)
-                fatal("realloc()");
+                fatal("reallocf()");
         }
     }
 }
@@ -363,7 +362,7 @@ void accept_conn(int fd, struct peer *peer)
 
     inet_ntop(af, peer->raw_addr_ptr, peer->ascii_addr, sizeof(peer->ascii_addr));
 
-    peer->is_connected = 1;
+    peer->is_connected = true;
     peer->fd = new_fd;
 }
 
