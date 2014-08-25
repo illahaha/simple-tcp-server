@@ -274,10 +274,6 @@ void *worker_thread(void *data)
     if (revents == NULL)
         fatal("calloc()");
 
-    struct kevent *events = calloc((size_t)num_revents, sizeof(*events));
-    if (events == NULL)
-        fatal("calloc()");
-
     size_t bufsiz = pagesize;
     unsigned char *buffer = malloc(bufsiz);
     if (buffer == NULL)
@@ -293,12 +289,10 @@ void *worker_thread(void *data)
                 fatal_strerror("Error processing events", (int)revents[i].data);
 
             if (revents[i].filter == EVFILT_USER && revents[i].ident == KQUEUE_REALLOC) {
-                revents = reallocf(revents, (size_t)num_revents * 2);
-                if (revents == NULL)
-                    fatal("reallocf()");
+                num_revents *= 2;
 
-                events = reallocf(events, (size_t)num_revents * 2);
-                if (events == NULL)
+                revents = reallocf(revents, (size_t)num_revents);
+                if (revents == NULL)
                     fatal("reallocf()");
 
                 add_to_kqueue(kqueue, KQUEUE_REALLOC, EVFILT_USER, EV_DISABLE, 0, 0, NULL);
