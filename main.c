@@ -293,8 +293,6 @@ void *worker_thread(void *data)
                 fatal_strerror("Error processing events", (int)revents[i].data);
 
             if (revents[i].filter == EVFILT_USER && revents[i].ident == KQUEUE_REALLOC) {
-                printf("Realloc...\n");
-
                 revents = reallocf(revents, (size_t)num_revents * 2);
                 if (revents == NULL)
                     fatal("reallocf()");
