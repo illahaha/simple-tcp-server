@@ -41,6 +41,8 @@
 #define ATOMIC_LOAD(x) __atomic_load_n(&(x), __ATOMIC_SEQ_CST)
 #define ATOMIC_STORE(x, y) __atomic_store_n(&(x), (y), __ATOMIC_SEQ_CST)
 
+#define KQUEUE_REALLOC 1
+
 struct peer {
     struct sockaddr_storage sockaddr;
     union {
@@ -56,7 +58,7 @@ struct peer {
 };
 
 struct worker_data {
-    int active_conn_kqueue;
+    int kqueue;
     int num_events;
 };
 
@@ -137,23 +139,33 @@ int main(int argc, const char *argv[])
         peer_ptrs[i]->is_connected = false;
     }
 
-    int worker_queue_fd = kqueue();
-    if (worker_queue_fd == -1)
-        fatal("kqueue()");
-
-    struct worker_data worker_data = {
-        .active_conn_kqueue = worker_queue_fd,
-        .num_events = max_num_active_conn
-    };
-
     int num_threads = get_num_cpus();
 
     pthread_t *threads = calloc((size_t)num_threads, sizeof(*threads));
     if (threads == NULL)
         fatal("calloc()");
 
+    struct worker_data *worker_data = calloc((size_t)num_threads, sizeof(*worker_data));
+    if (worker_data == NULL)
+        fatal("calloc()");
+
+    int *kqueues = calloc((size_t)num_threads, sizeof(*kqueues));
+    if (kqueues == NULL)
+        fatal("calloc()");
+
     for (int i = 0; i < num_threads; ++i) {
-        err = pthread_create(&threads[i], NULL, worker_thread, &worker_data);
+        kqueues[i] = kqueue();
+        if (kqueues[i] == -1)
+            fatal("kqueue()");
+
+        add_to_kqueue(kqueues[i], KQUEUE_REALLOC, EVFILT_USER, EV_ADD | EV_DISABLE, 0, 0, NULL);
+
+        worker_data[i] = (struct worker_data){
+            .kqueue = kqueues[i],
+            .num_events = max_num_active_conn / num_threads
+        };
+
+        err = pthread_create(&threads[i], NULL, worker_thread, &worker_data[i]);
         if (err != 0)
             fatal_strerror("pthread_create()", err);
 
@@ -177,7 +189,7 @@ int main(int argc, const char *argv[])
 
     fprintf(stderr, "[INFO] Waiting for incoming connections...\n");
 
-    for (int idx = 0; ;) {
+    for (int idx = 0, curr_thread_idx = 0; ;) {
         struct kevent revents[3];
         int events_triggered = kevent(accept_queue_fd, NULL, 0, revents, 3, NULL);
         if (events_triggered == -1)
@@ -213,8 +225,11 @@ int main(int argc, const char *argv[])
 
             accept_conn(sockfd, peer);
 
-            add_to_kqueue(worker_queue_fd, (uintptr_t)peer->fd, EVFILT_READ,
-                          EV_ADD | EV_DISPATCH, 0, 0, peer);
+            add_to_kqueue(kqueues[curr_thread_idx++], (uintptr_t)peer->fd,
+                          EVFILT_READ, EV_ADD, 0, 0, peer);
+
+            if (curr_thread_idx == num_threads)
+                curr_thread_idx = 0;
 
             fprintf(stderr, "[INFO] New connection from %s:%u\n",
                     peer->ascii_addr, peer->port);
@@ -241,7 +256,8 @@ int main(int argc, const char *argv[])
 
             idx = old_size;
 
-            ATOMIC_STORE(worker_data.num_events, max_num_active_conn);
+            for (int j = 0; j < num_threads; ++j)
+                add_to_kqueue(kqueues[j], KQUEUE_REALLOC, EVFILT_USER, EV_ENABLE, NOTE_TRIGGER, 0, NULL);
         }
     }
 }
@@ -249,8 +265,10 @@ int main(int argc, const char *argv[])
 void *worker_thread(void *data)
 {
     struct worker_data *info = data;
-    int kqueue = info->active_conn_kqueue;
+    int kqueue = info->kqueue;
     int num_revents = info->num_events;
+
+    size_t pagesize = (size_t)getpagesize();
 
     struct kevent *revents = calloc((size_t)num_revents, sizeof(*revents));
     if (revents == NULL)
@@ -260,24 +278,35 @@ void *worker_thread(void *data)
     if (events == NULL)
         fatal("calloc()");
 
-    size_t bufsiz = 8192; // Should be big enough for most things
+    size_t bufsiz = pagesize;
     unsigned char *buffer = malloc(bufsiz);
     if (buffer == NULL)
         fatal("malloc()");
 
-    int re_add_event = 0;
-
     for (;;) {
-        int events_recvd = kevent(kqueue, events, re_add_event,
-                                  revents, num_revents, NULL);
+        int events_recvd = kevent(kqueue, NULL, 0, revents, num_revents, NULL);
         if (events_recvd == -1)
             fatal("kevent()");
-
-        re_add_event = 0;
 
         for (int i = 0; i < events_recvd; ++i) {
             if (revents[i].flags & EV_ERROR)
                 fatal_strerror("Error processing events", (int)revents[i].data);
+
+            if (revents[i].filter == EVFILT_USER && revents[i].ident == KQUEUE_REALLOC) {
+                printf("Realloc...\n");
+
+                revents = reallocf(revents, (size_t)num_revents * 2);
+                if (revents == NULL)
+                    fatal("reallocf()");
+
+                events = reallocf(events, (size_t)num_revents * 2);
+                if (events == NULL)
+                    fatal("reallocf()");
+
+                add_to_kqueue(kqueue, KQUEUE_REALLOC, EVFILT_USER, EV_DISABLE, 0, 0, NULL);
+
+                continue;
+            }
 
             assert(revents[i].filter = EVFILT_READ);
 
@@ -302,7 +331,7 @@ void *worker_thread(void *data)
                     peer->port, bytes_to_read);
 
             if (bytes_to_read > bufsiz) {
-                bufsiz = bytes_to_read;
+                bufsiz = bytes_to_read + (pagesize - bytes_to_read % pagesize);
                 buffer = reallocf(buffer, bufsiz);
                 if (buffer == NULL)
                     fatal("reallocf()");
@@ -318,23 +347,6 @@ void *worker_thread(void *data)
                 fatal("write()");
 
             fprintf(stderr, "\n[END DATA]\n");
-
-            EV_SET(&events[re_add_event++], revents[i].ident, revents[i].filter,
-                   EV_ENABLE, revents[i].fflags, revents[i].data, revents[i].udata);
-        }
-
-        int new_num_events = ATOMIC_LOAD(info->num_events);
-
-        if (new_num_events != num_revents) {
-            num_revents = new_num_events;
-
-            revents = reallocf(revents, (size_t)num_revents);
-            if (revents == NULL)
-                fatal("reallocf()");
-
-            events = reallocf(events, (size_t)num_revents);
-            if (events == NULL)
-                fatal("reallocf()");
         }
     }
 }
