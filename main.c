@@ -69,7 +69,7 @@ static noreturn void fatal_gai(const char *msg, int err);
 
 static int str_to_int(const char *str, int base);
 
-static int get_num_cpus(void);
+static int get_num_logical_cpus(void);
 static int get_somaxconn(void);
 
 static void *worker_thread(void *data);
@@ -83,22 +83,13 @@ static int get_free_peer(struct peer *const *peer_ptrs, int max, int hint);
 
 int main(int argc, const char *argv[])
 {
-    if (argc < 2)
-        fatal2("Missing port number as argument");
+    if (argc < 2 || strcmp(argv[1], "help") == 0)
+        fatal2("usage: <port> (optional) <# threads>");
 
-    int somaxconn = get_somaxconn();
-    int backlog = somaxconn;
-    if (argc == 3) {
-        backlog = str_to_int(argv[2], 0);
+    int num_threads = get_num_logical_cpus();
 
-        if (backlog == 0)
-            fatal2("Backlog has to be bigger than 0.\n");
-
-        if (backlog > somaxconn) {
-            fprintf(stderr, "Backlog exceeds kern.ipc.somaxconn, truncating...\n");
-            backlog = somaxconn;
-        }
-    }
+    if (argv[2] != NULL)
+        num_threads = str_to_int(argv[2], 0);
 
     struct addrinfo hints = {
         .ai_flags = AI_ADDRCONFIG | AI_PASSIVE,
@@ -122,24 +113,22 @@ int main(int argc, const char *argv[])
 
     freeaddrinfo(addrinfo);
 
-    if (listen(sockfd, backlog) == -1)
+    int somaxconn = get_somaxconn();
+
+    if (listen(sockfd, somaxconn) == -1)
         fatal("listen()");
 
-    int max_num_active_conn = backlog;
-
-    struct peer **peer_ptrs = calloc((size_t)max_num_active_conn, sizeof(*peer_ptrs));
+    struct peer **peer_ptrs = calloc((size_t)somaxconn, sizeof(*peer_ptrs));
     if (peer_ptrs == NULL)
         fatal("calloc()");
 
-    for (int i = 0; i < max_num_active_conn; ++i) {
+    for (int i = 0; i < somaxconn; ++i) {
         peer_ptrs[i] = malloc(sizeof(*peer_ptrs[i]));
         if (peer_ptrs[i] == NULL)
             fatal("malloc()");
 
         peer_ptrs[i]->is_connected = false;
     }
-
-    int num_threads = get_num_cpus();
 
     pthread_t *threads = calloc((size_t)num_threads, sizeof(*threads));
     if (threads == NULL)
@@ -162,7 +151,7 @@ int main(int argc, const char *argv[])
 
         worker_data[i] = (struct worker_data){
             .kqueue = kqueues[i],
-            .num_events = max_num_active_conn / num_threads
+            .num_events = somaxconn / num_threads
         };
 
         err = pthread_create(&threads[i], NULL, worker_thread, &worker_data[i]);
@@ -197,7 +186,7 @@ int main(int argc, const char *argv[])
 
         for (int i = 0; i < events_triggered; ++i) {
             if (revents[i].flags & EV_ERROR)
-                fatal_strerror("Error processing events", (int)revents[i].data);
+                fatal_strerror("error processing events", (int)revents[i].data);
 
             if (revents[i].filter == EVFILT_SIGNAL) {
                 fprintf(stderr, "[INFO] Got signal #%d.\n", (int)revents[i].ident);
@@ -207,7 +196,7 @@ int main(int argc, const char *argv[])
 
                 fprintf(stderr, "[INFO] Shutting down...\n");
 
-                for (int j = 0; j < max_num_active_conn; ++j)
+                for (int j = 0; j < somaxconn; ++j)
                     if (peer_ptrs[j]->is_connected)
                         shutdown(peer_ptrs[j]->fd, SHUT_RDWR);
 
@@ -234,19 +223,19 @@ int main(int argc, const char *argv[])
             fprintf(stderr, "[INFO] New connection from %s:%u\n",
                     peer->ascii_addr, peer->port);
 
-            idx = get_free_peer(peer_ptrs, max_num_active_conn, idx);
+            idx = get_free_peer(peer_ptrs, somaxconn, idx);
             if (idx != -1)
                 continue;
 
             // No unconnected peers, reallocate...
-            int old_size = max_num_active_conn;
-            max_num_active_conn *= 2;
+            int old_size = somaxconn;
+            somaxconn *= 1.3;
 
-            peer_ptrs = reallocf(peer_ptrs, (size_t)max_num_active_conn);
+            peer_ptrs = reallocf(peer_ptrs, (size_t)somaxconn);
             if (peer_ptrs == NULL)
                 fatal("reallocf()");
 
-            for (int j = old_size; j < max_num_active_conn; ++j) {
+            for (int j = old_size; j < somaxconn; ++j) {
                 peer_ptrs[j] = malloc(sizeof(*peer_ptrs[j]));
                 if (peer_ptrs[j] == NULL)
                     fatal("malloc()");
@@ -425,11 +414,11 @@ int str_to_int(const char *str, int base)
     if (ret > INT_MAX || ret < INT_MIN)
         fatal_strerror("strtol()", ERANGE);
     if (*endptr != '\0')
-        fatal2("String to int conversion: encountered garbage");
+        fatal2("string to int conversion: encountered garbage");
     return (int)ret;
 }
 
-int get_num_cpus(void)
+int get_num_logical_cpus(void)
 {
     int num_cpus;
     size_t size = sizeof(num_cpus);
