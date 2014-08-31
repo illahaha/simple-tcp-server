@@ -229,7 +229,7 @@ int main(int argc, const char *argv[])
 
             // No unconnected peers, reallocate...
             int old_size = somaxconn;
-            somaxconn *= 1.3;
+            somaxconn *= 2;
 
             peer_ptrs = reallocf(peer_ptrs, (size_t)somaxconn);
             if (peer_ptrs == NULL)
