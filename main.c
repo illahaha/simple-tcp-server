@@ -44,17 +44,16 @@
 #define KQUEUE_REALLOC 1
 
 struct peer {
-    struct sockaddr_storage sockaddr;
     union {
-        void *raw_addr_ptr;
-        struct in_addr *ip4_addr_ptr;
-        struct in6_addr *ip6_addr_ptr;
-    }; // Points into sockaddr.
+        struct sockaddr_storage storage;
+        struct sockaddr_in6 in6;
+        struct sockaddr_in in;
+    } sockaddr;
+
     int fd;
     in_port_t port;
     bool is_connected;
     char ascii_addr[INET6_ADDRSTRLEN];
-    char __pad[3];
 };
 
 struct worker_data {
@@ -343,21 +342,17 @@ void accept_conn(int fd, struct peer *peer)
     if (new_fd == -1)
         fatal("accept()");
 
-    int af = peer->sockaddr.ss_family;
+    int af = peer->sockaddr.storage.ss_family;
     switch (af) {
-    case AF_INET: {
-        struct sockaddr_in *addr = (void *)&peer->sockaddr;
-        peer->ip4_addr_ptr = &addr->sin_addr;
-        peer->port = addr->sin_port;
-        break; }
-    case AF_INET6: {
-        struct sockaddr_in6 *addr = (void *)&peer->sockaddr;
-        peer->ip6_addr_ptr = &addr->sin6_addr;
-        peer->port = addr->sin6_port;
-        break; }
+    case AF_INET:
+        peer->port = peer->sockaddr.in.sin_port;
+        break;
+    case AF_INET6:
+        peer->port = peer->sockaddr.in6.sin6_port;
+        break;
     }
 
-    inet_ntop(af, peer->raw_addr_ptr, peer->ascii_addr, sizeof(peer->ascii_addr));
+    inet_ntop(af, &peer->sockaddr, peer->ascii_addr, sizeof(peer->ascii_addr));
 
     peer->is_connected = true;
     peer->fd = new_fd;
