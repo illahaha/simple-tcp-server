@@ -67,7 +67,7 @@ static noreturn void fatal2(const char *msg);
 static noreturn void fatal_strerror(const char *msg, int err);
 static noreturn void fatal_gai(const char *msg, int err);
 
-static int str_to_int(const char *str, int base);
+static int str_to_int(const char *str);
 
 static int get_num_logical_cpus(void);
 static int get_somaxconn(void);
@@ -84,12 +84,16 @@ static int get_free_peer(struct peer *const *peer_ptrs, int max, int hint);
 int main(int argc, const char *argv[])
 {
     if (argc < 2 || strcmp(argv[1], "help") == 0)
-        fatal2("usage: <port> (optional) <# threads>");
+        fatal2("Usage: <port> (optional) <# threads>");
 
     int num_threads = get_num_logical_cpus();
 
-    if (argv[2] != NULL)
-        num_threads = str_to_int(argv[2], 0);
+    if (argv[2] != NULL) {
+        num_threads = str_to_int(argv[2]);
+
+        if (num_threads == 0)
+            fatal2("Invalid number of threads, has to be 1 or more");
+    }
 
     struct addrinfo hints = {
         .ai_flags = AI_ADDRCONFIG | AI_PASSIVE,
@@ -186,7 +190,7 @@ int main(int argc, const char *argv[])
 
         for (int i = 0; i < events_triggered; ++i) {
             if (revents[i].flags & EV_ERROR)
-                fatal_strerror("error processing events", (int)revents[i].data);
+                fatal_strerror("Error processing events", (int)revents[i].data);
 
             if (revents[i].filter == EVFILT_SIGNAL) {
                 fprintf(stderr, "[INFO] Got signal #%d.\n", (int)revents[i].ident);
@@ -383,38 +387,39 @@ int get_free_peer(struct peer *const *peer_ptrs, int max, int hint)
 
 void fatal(const char *msg)
 {
+    fprintf(stderr, "Error: ");
     perror(msg);
     exit(EXIT_FAILURE);
 }
 
 void fatal2(const char *msg)
 {
-    fprintf(stderr, "%s\n", msg);
+    fprintf(stderr, "Error: %s\n", msg);
     exit(EXIT_FAILURE);
 }
 
 void fatal_strerror(const char *msg, int err)
 {
-    fprintf(stderr, "%s: %s\n", msg, strerror(err));
+    fprintf(stderr, "Error: %s: %s\n", msg, strerror(err));
     exit(EXIT_FAILURE);
 }
 
 void fatal_gai(const char *msg, int err)
 {
-    fprintf(stderr, "%s: %s\n", msg, gai_strerror(err));
+    fprintf(stderr, "Error: %s: %s\n", msg, gai_strerror(err));
     exit(EXIT_FAILURE);
 }
 
-int str_to_int(const char *str, int base)
+int str_to_int(const char *str)
 {
     char *endptr;
-    long ret = strtol(str, &endptr, base);
+    long ret = strtol(str, &endptr, 0);
     if (errno != 0)
         fatal("strtol()");
     if (ret > INT_MAX || ret < INT_MIN)
         fatal_strerror("strtol()", ERANGE);
     if (*endptr != '\0')
-        fatal2("string to int conversion: encountered garbage");
+        fatal2("String to int conversion: encountered garbage");
     return (int)ret;
 }
 
