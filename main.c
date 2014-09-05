@@ -45,11 +45,11 @@
 
 struct peer {
     union {
-        struct sockaddr_storage storage;
-        struct sockaddr_in6 in6;
-        struct sockaddr_in in;
-    } sockaddr;
+        struct in_addr in;
+        struct in6_addr in6;
+    } binary_addr;
 
+    sa_family_t af;
     int fd;
     in_port_t port;
     bool is_connected;
@@ -337,22 +337,28 @@ void *worker_thread(void *data)
 
 void accept_conn(int fd, struct peer *peer)
 {
-    socklen_t size = sizeof(peer->sockaddr);
-    int new_fd = accept(fd, (struct sockaddr *)&peer->sockaddr, &size);
+    struct sockaddr_storage sockaddr;
+    socklen_t size = sizeof(sockaddr);
+    int new_fd = accept(fd, (struct sockaddr *)&sockaddr, &size);
     if (new_fd == -1)
         fatal("accept()");
 
-    int af = peer->sockaddr.storage.ss_family;
+    int af = sockaddr.ss_family;
     switch (af) {
-    case AF_INET:
-        peer->port = peer->sockaddr.in.sin_port;
-        break;
-    case AF_INET6:
-        peer->port = peer->sockaddr.in6.sin6_port;
-        break;
+    case AF_INET: {
+        struct sockaddr_in *x = (struct sockaddr_in *)&sockaddr;
+        peer->binary_addr.in = x->sin_addr;
+        peer->port = x->sin_port;
+        break; }
+    case AF_INET6: {
+        struct sockaddr_in6 *x = (struct sockaddr_in6 *)&sockaddr;
+        peer->binary_addr.in6 = x->sin6_addr;
+        peer->port = x->sin6_port;
+        break; }
     }
 
-    inet_ntop(af, &peer->sockaddr, peer->ascii_addr, sizeof(peer->ascii_addr));
+    if (inet_ntop(af, &peer->binary_addr, peer->ascii_addr, sizeof(peer->ascii_addr)) == NULL)
+        fatal("inet_ntop()");
 
     peer->is_connected = true;
     peer->fd = new_fd;
